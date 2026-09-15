@@ -8,19 +8,38 @@ import ApplicationServices
 /// Accessibility is also the only API that distinguishes a minimized window
 /// from one sitting on another Space -- CGWindowList reports both as offscreen.
 struct WinInfo {
+    /// AXUIElement identity is stable for the lifetime of a window.  A title
+    /// is not: documents can be renamed, and several windows can share one.
+    let id: WindowID
     let element: AXUIElement
     let pid: pid_t
     let title: String
     let frame: CGRect  // CoreGraphics global coords: origin top-left of primary screen, y down
+    /// The last display on which the window was actually visible. A minimized
+    /// window's AX frame is not consistently reported by every application.
+    let displayID: CGDirectDisplayID?
     /// Minimized, or its app is hidden. Not visible on any screen right now.
     let stowed: Bool
 }
 
+struct WindowID: Hashable {
+    let pid: pid_t
+    let axHash: CFHashCode
+}
+
 extension WinInfo: Equatable {
     static func == (a: WinInfo, b: WinInfo) -> Bool {
-        CFEqual(a.element, b.element) && a.frame == b.frame
+        a.id == b.id && a.frame == b.frame && a.displayID == b.displayID
             && a.stowed == b.stowed && a.title == b.title
     }
+}
+
+struct WindowLocation {
+    let element: AXUIElement
+    var frame: CGRect
+    var displayID: CGDirectDisplayID?
+    var order: Int
+    var lastSeen: Date
 }
 
 func axValue(_ el: AXUIElement, _ key: String) -> CFTypeRef? {
@@ -56,12 +75,13 @@ func cgFrame(of screen: NSScreen) -> CGRect {
 /// Puts a window on `screen`, keeping its offset within whatever screen it was
 /// on and nudging it back inside if it would hang off the edge. No-op when the
 /// window is already there.
-@MainActor func move(_ element: AXUIElement, onto screen: NSScreen) {
-    guard let frame = axFrame(element),
-          screenContaining(frame)?.displayID != screen.displayID
-    else { return }
+@MainActor func move(_ element: AXUIElement, frame knownFrame: CGRect? = nil,
+                     from sourceScreen: NSScreen? = nil, onto screen: NSScreen) {
+    guard let frame = axFrame(element) ?? knownFrame else { return }
+    let fromScreen = sourceScreen ?? screenContaining(frame)
+    guard fromScreen?.displayID != screen.displayID else { return }
     let to = cgFrame(of: screen)
-    let from = screenContaining(frame).map(cgFrame(of:)) ?? to
+    let from = fromScreen.map(cgFrame(of:)) ?? to
     let x = to.minX + (frame.minX - from.minX)
     let y = to.minY + (frame.minY - from.minY)
     setAXPosition(element, CGPoint(
@@ -69,8 +89,10 @@ func cgFrame(of screen: NSScreen) -> CGRect {
         y: min(max(y, to.minY), max(to.minY, to.maxY - frame.height))))
 }
 
-@MainActor func listWindows() -> [WinInfo] {
+@MainActor func listWindows(using locations: inout [WindowID: WindowLocation]) -> [WinInfo] {
     var out: [WinInfo] = []
+    let now = Date()
+    var nextOrder = locations.values.map(\.order).max().map { $0 + 1 } ?? 0
     for app in NSWorkspace.shared.runningApplications
     where app.activationPolicy == .regular {
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
@@ -85,22 +107,55 @@ func cgFrame(of screen: NSScreen) -> CGRect {
             // manage", and it also excludes Finder's desktop window, which has
             // no subrole at all.
             guard axValue(w, kAXSubroleAttribute) as? String == kAXStandardWindowSubrole
-                    || axValue(w, kAXMinimizeButtonAttribute) != nil,
-                  let frame = axFrame(w)
+                    || axValue(w, kAXMinimizeButtonAttribute) != nil
             else { continue }
             let minimized = axValue(w, kAXMinimizedAttribute) as? Bool ?? false
+            let hidden = app.isHidden
+            let id = WindowID(pid: app.processIdentifier, axHash: CFHash(w))
+            let old = locations[id]
+            let reportedFrame = axFrame(w)
+            guard let visibleFrame = reportedFrame ?? old?.frame else { continue }
+            locations[id]?.lastSeen = now
+            let currentDisplay = reportedFrame.flatMap { screenContaining($0)?.displayID }
+            // Some apps expose the minimized frame at the Dock's location and
+            // others expose the old frame. Never let that transient value move
+            // a stowed tile to the wrong display.
+            let displayID = (minimized || hidden) ? (old?.displayID ?? currentDisplay) : currentDisplay
+            if !minimized && !hidden {
+                if old == nil {
+                    locations[id] = WindowLocation(element: w, frame: visibleFrame,
+                                                   displayID: currentDisplay, order: nextOrder,
+                                                   lastSeen: now)
+                    nextOrder += 1
+                } else {
+                    locations[id]?.frame = visibleFrame
+                    locations[id]?.displayID = currentDisplay
+                }
+            } else if old == nil {
+                locations[id] = WindowLocation(element: w, frame: visibleFrame,
+                                               displayID: displayID, order: nextOrder,
+                                               lastSeen: now)
+                nextOrder += 1
+            }
             out.append(WinInfo(
+                id: id,
                 element: w,
                 pid: app.processIdentifier,
                 title: axValue(w, kAXTitleAttribute) as? String ?? app.localizedName ?? "",
-                frame: frame,
-                stowed: minimized || app.isHidden))
+                frame: (minimized || hidden) ? (old?.frame ?? visibleFrame) : visibleFrame,
+                displayID: displayID,
+                stowed: minimized || hidden))
         }
     }
-    // Calendar reports its window twice. Identical windows would draw as
-    // duplicate tiles, so collapse them.
-    var seen = Set<String>()
-    return out.filter { seen.insert("\($0.pid)|\($0.title)|\($0.frame)").inserted }
+    // A few applications report the same AX window more than once.
+    var seen = Set<WindowID>()
+    return out.filter { seen.insert($0.id).inserted }
+        .sorted { (locations[$0.id]?.order ?? .max) < (locations[$1.id]?.order ?? .max) }
+}
+
+@MainActor func listWindows() -> [WinInfo] {
+    var locations: [WindowID: WindowLocation] = [:]
+    return listWindows(using: &locations)
 }
 
 /// CG global point (y down, from primary top) -> Cocoa global point (y up, from primary bottom).
@@ -114,7 +169,12 @@ func screenContaining(_ cgRect: CGRect) -> NSScreen? {
     return NSScreen.screens.first { $0.frame.contains(c) }
 }
 
-func screenOf(_ w: WinInfo) -> NSScreen? { screenContaining(w.frame) }
+func screenOf(_ w: WinInfo) -> NSScreen? {
+    if let id = w.displayID, let screen = NSScreen.screens.first(where: { $0.displayID == id }) {
+        return screen
+    }
+    return screenContaining(w.frame)
+}
 
 /// Display currently hosting the real macOS Dock, which draws one window at
 /// the dock level spanning exactly that display. Follows the Dock as it moves.
@@ -128,7 +188,8 @@ func realDockScreen() -> CGDirectDisplayID? {
     for d in raw where d[kCGWindowLayer as String] as? Int == dockLevel {
         guard d[kCGWindowOwnerName as String] as? String == "Dock",
               let bd = d[kCGWindowBounds as String],
-              let rect = CGRect(dictionaryRepresentation: bd as! CFDictionary),
+              let bounds = bd as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bounds),
               let id = screenContaining(rect)?.displayID
         else { continue }
         return id
@@ -146,7 +207,7 @@ func realDockScreen() -> CGDirectDisplayID? {
 @MainActor func raise(_ w: WinInfo, onto screen: NSScreen) {
     let app = NSRunningApplication(processIdentifier: w.pid)
     app?.unhide()
-    move(w.element, onto: screen)
+    move(w.element, frame: w.frame, from: screenOf(w), onto: screen)
     AXUIElementSetAttributeValue(w.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
     AXUIElementSetAttributeValue(w.element, kAXMainAttribute as CFString, kCFBooleanTrue)
     AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
@@ -165,14 +226,21 @@ struct DockStyle: Equatable {
     var large: CGFloat = 128
     var magnify = false
     var edge: DockEdge = .bottom
+    var autoHide = false
+    var autoHideDelay: TimeInterval = 0.15
+    var animationDuration: TimeInterval = 0.18
+    var showIndicators = true
+    var minimizeEffect = "genie"
 
-    // ponytail: ratios calibrated against the stock Dock -- tilesize 42 yields
-    // a 62pt screen inset (8 pad + 42 tile + 8 pad + 4 margin). Tune here if a
-    // future macOS restyles the Dock.
+    // Ratios calibrated against the stock Dock. The indicator has its own
+    // visual lane; it must not make the configured icon smaller.
     var pad: CGFloat { round(tile * 0.19) }
     var gap: CGFloat { round(tile * 0.12) }
     var margin: CGFloat { round(tile * 0.10) }
-    var thickness: CGFloat { tile + 2 * pad }
+    func indicatorLane(for iconSize: CGFloat) -> CGFloat {
+        showIndicators ? max(4, min(8, iconSize * 0.14)) : 0
+    }
+    var thickness: CGFloat { tile + indicatorLane(for: tile) + 2 * pad }
     var radius: CGFloat { thickness / 2 }
     var maxScale: CGFloat { magnify ? max(1, large / tile) : 1 }
     var isVertical: Bool { edge != .bottom }
@@ -180,13 +248,30 @@ struct DockStyle: Equatable {
     static func current() -> DockStyle {
         let d = UserDefaults(suiteName: "com.apple.dock")
         func num(_ key: String, _ fallback: CGFloat) -> CGFloat {
-            (d?.object(forKey: key) as? Double).map { CGFloat($0) } ?? fallback
+            if let value = d?.object(forKey: key) as? NSNumber {
+                return CGFloat(truncating: value)
+            }
+            return fallback
         }
+        func flag(_ key: String, _ fallback: Bool) -> Bool {
+            (d?.object(forKey: key) as? NSNumber)?.boolValue ?? fallback
+        }
+        let tile = min(max(num("tilesize", 48), 16), 256)
+        let large = min(max(num("largesize", 128), tile), 512)
+        let delay = min(max(num("autohide-delay", 0.15), 0), 2)
         return DockStyle(
-            tile: num("tilesize", 48),
-            large: num("largesize", 128),
-            magnify: d?.bool(forKey: "magnification") ?? false,
-            edge: DockEdge(rawValue: d?.string(forKey: "orientation") ?? "") ?? .bottom
+            tile: tile,
+            large: large,
+            magnify: flag("magnification", false),
+            edge: DockEdge(rawValue: d?.string(forKey: "orientation") ?? "") ?? .bottom,
+            autoHide: flag("autohide", false),
+            autoHideDelay: TimeInterval(delay),
+            animationDuration: 0.18,
+            showIndicators: flag("show-process-indicators", true),
+            minimizeEffect: d?.string(forKey: "mineffect") ?? "genie",
+            // Dock's exact animation curve is private. This duration tracks
+            // its short settle animation and is used consistently for hover,
+            // reveal, and preference changes.
         )
     }
 }
@@ -195,6 +280,59 @@ struct DockStyle: Equatable {
 
 final class WinButton: NSButton {
     var win: WinInfo!
+    var icon: NSImage?
+    var indicatorEdge: DockEdge = .bottom
+    var showsIndicator = true
+
+    /// Use a known coordinate system: y grows down, so the indicator lane for
+    /// a bottom dock is always the physical bottom of the tile.
+    override var isFlipped: Bool { true }
+
+    private var indicatorLane: CGFloat {
+        guard showsIndicator else { return 0 }
+        return max(4, min(8, min(bounds.width, bounds.height) * 0.14))
+    }
+
+    private func iconRect(in bounds: NSRect) -> NSRect {
+        var rect = bounds
+        let lane = indicatorLane
+        guard lane > 0 else { return rect }
+        switch indicatorEdge {
+        case .bottom:
+            rect.size.height = max(1, rect.height - lane)
+        case .left:
+            rect.size.width = max(1, rect.width - lane)
+        case .right:
+            rect.origin.x += lane
+            rect.size.width = max(1, rect.width - lane)
+        }
+        return rect
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if let icon {
+            icon.draw(in: iconRect(in: bounds), from: .zero, operation: .sourceOver,
+                      fraction: 1, respectFlipped: true, hints: nil)
+        }
+        guard showsIndicator, win != nil else { return }
+        let diameter = max(2, min(4, bounds.width * 0.07))
+        let rect: NSRect
+        switch indicatorEdge {
+        case .bottom:
+            rect = NSRect(x: bounds.midX - diameter / 2, y: bounds.maxY - diameter - 1,
+                          width: diameter, height: diameter)
+        case .left:
+            rect = NSRect(x: bounds.maxX - diameter - 1, y: bounds.midY - diameter / 2,
+                          width: diameter, height: diameter)
+        case .right:
+            rect = NSRect(x: 1, y: bounds.midY - diameter / 2,
+                          width: diameter, height: diameter)
+        }
+        NSColor.labelColor.withAlphaComponent(0.85).setFill()
+        NSBezierPath(ovalIn: rect).fill()
+    }
+
 }
 
 /// Glass strip plus the icon row. Icons are siblings of the glass view, not its
@@ -204,6 +342,7 @@ final class DockContentView: NSView {
     var style = DockStyle()
     /// Cursor position along the layout axis, in view coords. nil when away.
     var cursor: CGFloat?
+    var layoutAnimationDuration: TimeInterval = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -216,12 +355,13 @@ final class DockContentView: NSView {
 
     /// Rect a tile occupies given its offset along the edge and its magnified size.
     private func tileRect(offset: CGFloat, size: CGFloat) -> NSRect {
-        switch style.edge {
-        case .bottom: NSRect(x: offset, y: style.pad, width: size, height: size)
+        let lane = style.indicatorLane(for: size)
+        return switch style.edge {
+        case .bottom: NSRect(x: offset, y: style.pad, width: size, height: size + lane)
         case .left:   NSRect(x: style.pad, y: bounds.height - offset - size,
-                             width: size, height: size)
-        case .right:  NSRect(x: bounds.width - style.pad - size,
-                             y: bounds.height - offset - size, width: size, height: size)
+                             width: size + lane, height: size)
+        case .right:  NSRect(x: bounds.width - style.pad - size - lane,
+                             y: bounds.height - offset - size, width: size + lane, height: size)
         }
     }
 
@@ -234,10 +374,10 @@ final class DockContentView: NSView {
         case .left:   NSRect(x: 0, y: 0, width: t, height: bounds.height)
         case .right:  NSRect(x: bounds.width - t, y: 0, width: t, height: bounds.height)
         }
-        layoutTiles()
+        layoutTiles(animated: false)
     }
 
-    func layoutTiles() {
+    func layoutTiles(animated: Bool = false) {
         let s = style, tiles = self.tiles
         guard !tiles.isEmpty else { return }
         let axis = s.isVertical ? bounds.height : bounds.width
@@ -259,11 +399,27 @@ final class DockContentView: NSView {
             centre += s.tile + s.gap
         }
 
-        let total = scales.reduce(0) { $0 + $1 * s.tile } + CGFloat(tiles.count - 1) * s.gap
+        var total = scales.reduce(0) { $0 + $1 * s.tile } + CGFloat(tiles.count - 1) * s.gap
+        // A dock cannot grow past the display. Preserve every window, but
+        // proportionally reduce the tile size when there is not enough room.
+        // This is preferable to clipping the last windows or making the
+        // panel extend onto a neighbouring display.
+        let usable = max(1, axis - 2 * s.pad)
+        let compression = min(1, (usable - CGFloat(max(0, tiles.count - 1)) * s.gap)
+            / max(1, scales.reduce(0) { $0 + $1 * s.tile }))
+        if compression < 1 {
+            scales = scales.map { $0 * compression }
+            total = scales.reduce(0) { $0 + $1 * s.tile } + CGFloat(tiles.count - 1) * s.gap
+        }
         var offset = (axis - total) / 2
         for (tile, k) in zip(tiles, scales) {
             let size = s.tile * k
-            tile.frame = tileRect(offset: offset, size: size)
+            let frame = tileRect(offset: offset, size: size)
+            if animated && layoutAnimationDuration > 0 {
+                tile.animator().frame = frame
+            } else {
+                tile.frame = frame
+            }
             offset += size + s.gap
         }
     }
@@ -275,12 +431,244 @@ final class DockContentView: NSView {
     }
 }
 
+// MARK: - Dock contextual menu
+
+private enum DockMenuEntry {
+    case action(title: String, enabled: Bool, hasSubmenu: Bool, handler: () -> Void)
+    case separator
+}
+
+/// A compact contextual surface using the system menu material. NSMenu is
+/// correct for normal application menus, but the Dock presents its contextual
+/// controls in a glass pop-up with tighter rows and rounded hover selection.
+private final class DockContextMenuPanel: NSPanel {
+    init(content: NSView) {
+        super.init(contentRect: content.bounds,
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        contentView = content
+        level = .popUpMenu
+        isFloatingPanel = true
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        hidesOnDeactivate = true
+        collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary]
+    }
+}
+
+private final class DockContextMenuRow: NSControl {
+    private let text: String
+    private let hasSubmenu: Bool
+    private let handler: () -> Void
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false { didSet { needsDisplay = true } }
+    private var pressed = false { didSet { needsDisplay = true } }
+
+    init(title: String, enabled: Bool, hasSubmenu: Bool, handler: @escaping () -> Void) {
+        self.text = title
+        self.hasSubmenu = hasSubmenu
+        self.handler = handler
+        super.init(frame: .zero)
+        isEnabled = enabled
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseEnteredAndExited],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard isEnabled else { return }
+        hovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        pressed = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { pressed = false }
+        guard isEnabled, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        handler()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered || pressed {
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(pressed ? 0.95 : 0.78).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 6, yRadius: 6).fill()
+        }
+
+        let style = NSMutableParagraphStyle()
+        style.alignment = .left
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
+            .foregroundColor: isEnabled ? NSColor.labelColor : NSColor.disabledControlTextColor,
+            .paragraphStyle: style
+        ]
+        let textRect = bounds.insetBy(dx: 14, dy: 0).offsetBy(dx: 0, dy: 7)
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
+
+        guard hasSubmenu else { return }
+        let chevron = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)!
+        let rect = NSRect(x: bounds.maxX - 22, y: bounds.midY - 5, width: 10, height: 10)
+        chevron.draw(in: rect, from: .zero, operation: .sourceOver,
+                     fraction: isEnabled ? 0.7 : 0.3, respectFlipped: true, hints: nil)
+    }
+}
+
+private final class DockMenuSeparator: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.withAlphaComponent(0.65).setFill()
+        NSBezierPath(rect: NSRect(x: 10, y: bounds.midY, width: bounds.width - 20, height: 1)).fill()
+    }
+}
+
+private final class DockContextMenuView: NSView {
+    private let glass = NSVisualEffectView()
+    private let drawsOwnBackground: Bool
+    private let entries: [DockMenuEntry]
+    private let padding: CGFloat = 6
+    private let rowHeight: CGFloat = 30
+    private let separatorHeight: CGFloat = 9
+
+    init(entries: [DockMenuEntry], drawsOwnBackground: Bool = true) {
+        self.entries = entries
+        self.drawsOwnBackground = drawsOwnBackground
+        let height = entries.reduce(CGFloat(12)) { partial, entry in
+            partial + (entry.isSeparator ? 9 : 30)
+        }
+        super.init(frame: NSRect(x: 0, y: 0, width: 224, height: height))
+        wantsLayer = true
+        if drawsOwnBackground {
+            glass.material = .menu
+            glass.blendingMode = .behindWindow
+            glass.state = .active
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = 12
+            glass.layer?.masksToBounds = true
+            addSubview(glass)
+        }
+
+        var top = bounds.maxY - padding
+        for entry in entries {
+            switch entry {
+            case let .action(title, enabled, hasSubmenu, handler):
+                top -= rowHeight
+                let row = DockContextMenuRow(title: title, enabled: enabled,
+                                             hasSubmenu: hasSubmenu, handler: handler)
+                row.frame = NSRect(x: padding, y: top, width: bounds.width - 2 * padding,
+                                   height: rowHeight)
+                addSubview(row)
+            case .separator:
+                top -= separatorHeight
+                let separator = DockMenuSeparator(frame: NSRect(x: 0, y: top,
+                                                                 width: bounds.width,
+                                                                 height: separatorHeight))
+                addSubview(separator)
+            }
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        if drawsOwnBackground { glass.frame = bounds }
+    }
+}
+
+/// The Dock's context menu is not a generic popover: its bubble has a short,
+/// curved pointer that touches the selected icon. Draw that silhouette
+/// directly so the panel has the same white surface, rim, and pointer shape.
+private final class DockContextBubbleView: NSView {
+    private let menuContent: DockContextMenuView
+    private let pointerX: CGFloat
+    private let pointerHeight: CGFloat = 18
+    private let cornerRadius: CGFloat = 20
+
+    init(menu: DockContextMenuView, pointerX: CGFloat) {
+        self.menuContent = menu
+        self.pointerX = min(max(pointerX, 34), menu.bounds.width - 34)
+        super.init(frame: NSRect(x: 0, y: 0, width: menu.bounds.width,
+                                 height: menu.bounds.height + pointerHeight))
+        menuContent.frame = NSRect(x: 0, y: pointerHeight, width: menu.bounds.width,
+                                   height: menu.bounds.height)
+        addSubview(menuContent)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let body = NSRect(x: 0, y: pointerHeight, width: bounds.width,
+                          height: bounds.height - pointerHeight)
+        let path = NSBezierPath()
+        let r = cornerRadius
+        let leftTail = pointerX - 13
+        let rightTail = pointerX + 13
+
+        path.move(to: NSPoint(x: body.minX + r, y: body.minY))
+        path.line(to: NSPoint(x: leftTail, y: body.minY))
+        path.curve(to: NSPoint(x: pointerX, y: 0),
+                   controlPoint1: NSPoint(x: leftTail + 5, y: body.minY),
+                   controlPoint2: NSPoint(x: pointerX - 7, y: 4))
+        path.curve(to: NSPoint(x: rightTail, y: body.minY),
+                   controlPoint1: NSPoint(x: pointerX + 7, y: 4),
+                   controlPoint2: NSPoint(x: rightTail - 5, y: body.minY))
+        path.line(to: NSPoint(x: body.maxX - r, y: body.minY))
+        path.curve(to: NSPoint(x: body.maxX, y: body.minY + r),
+                   controlPoint1: NSPoint(x: body.maxX - r * 0.45, y: body.minY),
+                   controlPoint2: NSPoint(x: body.maxX, y: body.minY + r * 0.45))
+        path.line(to: NSPoint(x: body.maxX, y: body.maxY - r))
+        path.curve(to: NSPoint(x: body.maxX - r, y: body.maxY),
+                   controlPoint1: NSPoint(x: body.maxX, y: body.maxY - r * 0.45),
+                   controlPoint2: NSPoint(x: body.maxX - r * 0.45, y: body.maxY))
+        path.line(to: NSPoint(x: body.minX + r, y: body.maxY))
+        path.curve(to: NSPoint(x: body.minX, y: body.maxY - r),
+                   controlPoint1: NSPoint(x: body.minX + r * 0.45, y: body.maxY),
+                   controlPoint2: NSPoint(x: body.minX, y: body.maxY - r * 0.45))
+        path.line(to: NSPoint(x: body.minX, y: body.minY + r))
+        path.curve(to: NSPoint(x: body.minX + r, y: body.minY),
+                   controlPoint1: NSPoint(x: body.minX, y: body.minY + r * 0.45),
+                   controlPoint2: NSPoint(x: body.minX + r * 0.45, y: body.minY))
+        path.close()
+
+        NSColor(calibratedWhite: 0.985, alpha: 0.97).setFill()
+        path.fill()
+        NSColor(calibratedWhite: 0.60, alpha: 0.70).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
+private extension DockMenuEntry {
+    var isSeparator: Bool {
+        if case .separator = self { return true }
+        return false
+    }
+}
+
 final class DockPanel: NSPanel {
     private var shown: [WinInfo] = []
     private var shownStyle: DockStyle?
+    private var shownScreenID: CGDirectDisplayID?
+    private var shownScreenFrame: NSRect = .zero
     /// The display this strip belongs to; clicking a tile sends the window here.
     private var homeScreen: NSScreen?
+    private var hideWorkItem: DispatchWorkItem?
+    private var contextPanels: [DockContextMenuPanel] = []
+    private var contextEventMonitor: Any?
+    private var contextPopover: NSPopover?
     private var body: DockContentView { contentView as! DockContentView }
+    var stateDidChange: (() -> Void)?
 
     init() {
         super.init(contentRect: .zero,
@@ -297,13 +685,22 @@ final class DockPanel: NSPanel {
     }
 
     func update(_ wins: [WinInfo], style: DockStyle, on screen: NSScreen) {
-        guard wins != shown || style != shownStyle else { return }
+        guard wins != shown || style != shownStyle
+                || screen.displayID != shownScreenID
+                || screen.frame != shownScreenFrame else { return }
         shown = wins
         shownStyle = style
+        shownScreenID = screen.displayID
+        shownScreenFrame = screen.frame
         homeScreen = screen
         body.style = style
+        body.layoutAnimationDuration = style.animationDuration
 
-        guard !wins.isEmpty else { orderOut(nil); return }
+        guard !wins.isEmpty else {
+            alphaValue = 1
+            orderOut(nil)
+            return
+        }
 
         body.tiles.forEach { $0.removeFromSuperview() }
         for w in wins {
@@ -313,16 +710,22 @@ final class DockPanel: NSPanel {
             b.bezelStyle = .regularSquare
             b.imagePosition = .imageOnly
             b.imageScaling = .scaleProportionallyUpOrDown
-            b.image = NSRunningApplication(processIdentifier: w.pid)?.icon
+            b.icon = NSRunningApplication(processIdentifier: w.pid)?.icon
+            b.image = nil
             b.toolTip = w.title
             b.alphaValue = w.stowed ? 0.45 : 1
+            b.indicatorEdge = style.edge
+            b.showsIndicator = style.showIndicators
             b.target = self
             b.action = #selector(click(_:))
+            b.menu = nativeContextMenu(for: b)
             body.addSubview(b)
         }
 
         // Room for the strip, plus headroom for magnified icons to spill out of it.
-        let depth = max(style.thickness, style.pad + style.tile * style.maxScale + style.pad)
+        let largestIcon = style.tile * style.maxScale
+        let depth = max(style.thickness,
+                        style.pad + largestIcon + style.indicatorLane(for: largestIcon) + style.pad)
         let n = CGFloat(wins.count)
         let length = n * style.tile * style.maxScale + (n - 1) * style.gap + 2 * style.pad
         let f = screen.frame
@@ -337,26 +740,411 @@ final class DockPanel: NSPanel {
         }
         setFrame(frame, display: true)
         body.needsLayout = true
-        orderFront(nil)
+        if style.autoHide && !nearEdge(NSEvent.mouseLocation) {
+            orderOut(nil)
+        } else {
+            reveal(animated: false)
+        }
     }
 
     /// Follow the cursor for magnification, and stay click-through everywhere
     /// the dock is not actually drawn.
     func hover(_ screenPoint: NSPoint) {
+        guard !shown.isEmpty else { return }
+        if body.style.autoHide {
+            if nearEdge(screenPoint) {
+                hideWorkItem?.cancel()
+                reveal(animated: true)
+            } else {
+                scheduleHide()
+                return
+            }
+        } else if !isVisible {
+            reveal(animated: true)
+        }
         let p = body.convert(convertPoint(fromScreen: screenPoint), from: nil)
         let inside = NSPointInRect(p, body.bounds)
-        body.cursor = inside ? (body.style.isVertical ? p.y : p.x) : nil
-        body.layoutTiles()
-        ignoresMouseEvents = !(inside && body.isInteractive(p))
+        let cursor: CGFloat? = inside ? (body.style.isVertical ? p.y : p.x) : nil
+        let changed: Bool
+        if let old = body.cursor, let cursor {
+            changed = abs(old - cursor) > 0.5
+        } else {
+            changed = body.cursor != cursor
+        }
+        body.cursor = cursor
+        if changed {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = body.style.animationDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                body.layoutAnimationDuration = context.duration
+                body.layoutTiles(animated: true)
+            }
+        }
+        // The panel is deliberately narrow, and keeping it mouse-enabled is
+        // more reliable than dynamically switching a non-activating panel to
+        // click-through just as a secondary click begins.
+        ignoresMouseEvents = false
+    }
+
+    private func nearEdge(_ point: NSPoint) -> Bool {
+        guard let screen = homeScreen, screen.frame.contains(point) else { return false }
+        let f = screen.frame
+        let slop: CGFloat = 5
+        switch body.style.edge {
+        case .bottom: return point.y <= f.minY + slop
+        case .left: return point.x <= f.minX + slop
+        case .right: return point.x >= f.maxX - slop
+        }
+    }
+
+    private func reveal(animated: Bool) {
+        hideWorkItem?.cancel()
+        guard !isVisible else { return }
+        ignoresMouseEvents = false
+        alphaValue = 0
+        orderFront(nil)
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = body.style.animationDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        } else {
+            alphaValue = 1
+        }
+    }
+
+    private func scheduleHide() {
+        hideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isVisible else { return }
+            self.orderOut(nil)
+        }
+        hideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + body.style.autoHideDelay, execute: work)
+    }
+
+    /// An NSPopover supplies the Dock-style speech-bubble pointer below the
+    /// menu while AppKit continues to own secondary-click tracking.
+    private func showContextPopover(for button: WinButton) {
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        let showTitle = button.win.stowed ? "Open" : "Show"
+        presentContextPopover(entries: [
+            .action(title: showTitle, enabled: true, hasSubmenu: false) { [weak self] in
+                self?.contextShow(button)
+            },
+            .action(title: "Show All Windows", enabled: app != nil, hasSubmenu: false) { [weak self] in
+                self?.contextShowAll(button)
+            },
+            .separator,
+            .action(title: "Options", enabled: true, hasSubmenu: true) { [weak self] in
+                self?.showOptionsPopover(for: button)
+            },
+            .separator,
+            .action(title: "Hide", enabled: app != nil && !(app?.isHidden ?? true), hasSubmenu: false) { [weak self] in
+                self?.contextHide(button)
+            },
+            .action(title: "Quit", enabled: app != nil, hasSubmenu: false) { [weak self] in
+                self?.contextQuit(button)
+            }
+        ], for: button)
+    }
+
+    private func showOptionsPopover(for button: WinButton) {
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        presentContextPopover(entries: [
+            .action(title: "Show in Finder", enabled: app?.bundleURL != nil, hasSubmenu: false) { [weak self] in
+                self?.contextShowInFinder(button)
+            }
+        ], for: button)
+    }
+
+    private func presentContextPopover(entries: [DockMenuEntry], for button: WinButton) {
+        contextPopover?.performClose(nil)
+        let content = DockContextMenuView(entries: entries, drawsOwnBackground: false)
+        let controller = NSViewController()
+        controller.view = content
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.appearance = NSAppearance(named: .aqua)
+        popover.contentViewController = controller
+        popover.contentSize = content.bounds.size
+        contextPopover = popover
+        // .maxY puts the popover above a bottom-edge dock tile, leaving its
+        // native arrow below the bubble and pointing directly at the icon.
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+    }
+
+    /// Use AppKit's native contextual-menu presentation for event tracking and
+    /// the system Dock's light frosted Aqua surface. Do not inherit the dark
+    /// appearance of an app behind the strip: Dock contextual menus stay light
+    /// and receive their rounded outline and shadow from AppKit.
+    private func nativeContextMenu(for button: WinButton) -> NSMenu {
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let showTitle = button.win.stowed ? "Open" : "Show"
+        menu.addItem(nativeMenuItem(showTitle, #selector(menuShow(_:)), button))
+        menu.addItem(nativeMenuItem("Show All Windows", #selector(menuShowAll(_:)), button,
+                                   enabled: app != nil))
+        menu.addItem(.separator())
+
+        let options = NSMenu(title: "Options")
+        options.addItem(nativeMenuItem("Show in Finder", #selector(menuShowInFinder(_:)), button,
+                                       enabled: app?.bundleURL != nil))
+        let optionsItem = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
+        optionsItem.submenu = options
+        menu.addItem(optionsItem)
+        menu.addItem(.separator())
+
+        menu.addItem(nativeMenuItem("Hide", #selector(menuHide(_:)), button,
+                                   enabled: app != nil && !(app?.isHidden ?? true)))
+        menu.addItem(nativeMenuItem("Quit", #selector(menuQuit(_:)), button, enabled: app != nil))
+        return menu
+    }
+
+    private func nativeMenuItem(_ title: String, _ action: Selector, _ button: WinButton,
+                                enabled: Bool = true) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = button
+        item.isEnabled = enabled
+        return item
+    }
+
+    private func menuButton(_ item: NSMenuItem) -> WinButton? {
+        item.representedObject as? WinButton
+    }
+
+    @objc private func menuShow(_ item: NSMenuItem) {
+        guard let button = menuButton(item) else { return }
+        contextShow(button)
+    }
+
+    @objc private func menuShowAll(_ item: NSMenuItem) {
+        guard let button = menuButton(item) else { return }
+        contextShowAll(button)
+    }
+
+    @objc private func menuShowInFinder(_ item: NSMenuItem) {
+        guard let button = menuButton(item) else { return }
+        contextShowInFinder(button)
+    }
+
+    @objc private func menuHide(_ item: NSMenuItem) {
+        guard let button = menuButton(item) else { return }
+        contextHide(button)
+    }
+
+    @objc private func menuQuit(_ item: NSMenuItem) {
+        guard let button = menuButton(item) else { return }
+        contextQuit(button)
+    }
+
+    private func showContextMenu(for button: WinButton) {
+        dismissContextMenus()
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        let showTitle = button.win.stowed ? "Open" : "Show"
+        presentContextMenu(entries: [
+            .action(title: showTitle, enabled: true, hasSubmenu: false) { [weak self] in
+                self?.contextShow(button)
+            },
+            .action(title: "Show All Windows", enabled: app != nil, hasSubmenu: false) { [weak self] in
+                self?.contextShowAll(button)
+            },
+            .separator,
+            .action(title: "Options", enabled: true, hasSubmenu: true) { [weak self] in
+                self?.showOptionsMenu(for: button)
+            },
+            .separator,
+            .action(title: "Hide", enabled: app != nil && !(app?.isHidden ?? true), hasSubmenu: false) { [weak self] in
+                self?.contextHide(button)
+            },
+            .action(title: "Quit", enabled: app != nil, hasSubmenu: false) { [weak self] in
+                self?.contextQuit(button)
+            }
+        ], for: button, alongside: nil)
+    }
+
+    private func showOptionsMenu(for button: WinButton) {
+        guard let root = contextPanels.first else { return }
+        contextPanels.dropFirst().forEach { $0.orderOut(nil) }
+        contextPanels = [root]
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        presentContextMenu(entries: [
+            .action(title: "Show in Finder", enabled: app?.bundleURL != nil, hasSubmenu: false) { [weak self] in
+                self?.contextShowInFinder(button)
+            }
+        ], for: button, alongside: root.frame)
+    }
+
+    private func presentContextMenu(entries: [DockMenuEntry], for button: WinButton,
+                                    alongside parentFrame: NSRect?) {
+        let panel: DockContextMenuPanel
+
+        // The bottom Dock's menu has a tail below the bubble. Position its
+        // tip over the icon, then keep the whole bubble inside the display.
+        if parentFrame == nil, body.style.edge == .bottom, let window = button.window {
+            let menu = DockContextMenuView(entries: entries, drawsOwnBackground: false)
+            let tile = window.convertToScreen(button.convert(button.bounds, to: nil))
+            let tileCenter = NSPoint(x: tile.midX, y: tile.midY)
+            let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(tileCenter) })
+                ?? homeScreen ?? NSScreen.main
+            guard let visible = screen?.visibleFrame else { return }
+            let desiredPointerOffset: CGFloat = 54
+            let x = min(max(tile.midX - desiredPointerOffset, visible.minX + 6),
+                        visible.maxX - menu.bounds.width - 6)
+            let bubble = DockContextBubbleView(menu: menu, pointerX: tile.midX - x)
+            let size = bubble.bounds.size
+            let y = min(max(tile.maxY, visible.minY + 6), visible.maxY - size.height - 6)
+            panel = DockContextMenuPanel(content: bubble)
+            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        } else {
+            let content = DockContextMenuView(entries: entries)
+            let size = content.bounds.size
+            let origin: NSPoint
+            if let parentFrame {
+                origin = NSPoint(x: parentFrame.maxX - 7, y: parentFrame.maxY - size.height - 4)
+            } else if let window = button.window {
+                let tile = window.convertToScreen(button.convert(button.bounds, to: nil))
+                switch body.style.edge {
+                case .bottom: origin = NSPoint(x: tile.midX - size.width / 2, y: tile.maxY + 8)
+                case .left: origin = NSPoint(x: tile.maxX + 8, y: tile.midY - size.height / 2)
+                case .right: origin = NSPoint(x: tile.minX - size.width - 8, y: tile.midY - size.height / 2)
+                }
+            } else {
+                origin = NSEvent.mouseLocation
+            }
+            let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(origin) })
+                ?? homeScreen ?? NSScreen.main
+            guard let visible = screen?.visibleFrame else { return }
+            let x = min(max(origin.x, visible.minX + 6), visible.maxX - size.width - 6)
+            let y = min(max(origin.y, visible.minY + 6), visible.maxY - size.height - 6)
+            panel = DockContextMenuPanel(content: content)
+            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        }
+        contextPanels.append(panel)
+        panel.orderFrontRegardless()
+        installContextDismissMonitor()
+    }
+
+    private func installContextDismissMonitor() {
+        guard contextEventMonitor == nil else { return }
+        contextEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self, !self.contextPanels.isEmpty else { return event }
+            let point: NSPoint
+            if let window = event.window {
+                point = window.convertToScreen(NSRect(origin: event.locationInWindow, size: .zero)).origin
+            } else {
+                point = NSEvent.mouseLocation
+            }
+            if !self.contextPanels.contains(where: { $0.frame.contains(point) }) {
+                self.dismissContextMenus()
+            }
+            return event
+        }
+    }
+
+    private func dismissContextMenus() {
+        contextPanels.forEach { $0.orderOut(nil) }
+        contextPanels.removeAll()
+        if let contextEventMonitor {
+            NSEvent.removeMonitor(contextEventMonitor)
+            self.contextEventMonitor = nil
+        }
+    }
+
+    private func dismissContextControls() {
+        contextPopover?.performClose(nil)
+        contextPopover = nil
+        dismissContextMenus()
+    }
+
+    private func contextShow(_ button: WinButton) {
+        defer { dismissContextControls() }
+        guard let homeScreen else { return }
+        raise(button.win, onto: homeScreen)
+    }
+
+    private func contextShowAll(_ button: WinButton) {
+        defer { dismissContextControls() }
+        let app = NSRunningApplication(processIdentifier: button.win.pid)
+        app?.unhide()
+        for window in shown where window.pid == button.win.pid {
+            AXUIElementSetAttributeValue(window.element, kAXMinimizedAttribute as CFString,
+                                         kCFBooleanFalse)
+            AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+        }
+        app?.activate()
+    }
+
+    private func contextShowInFinder(_ button: WinButton) {
+        defer { dismissContextControls() }
+        guard let url = NSRunningApplication(processIdentifier: button.win.pid)?.bundleURL
+        else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func contextHide(_ button: WinButton) {
+        defer { dismissContextControls() }
+        NSRunningApplication(processIdentifier: button.win.pid)?.hide()
+        stateDidChange?()
+    }
+
+    private func contextQuit(_ button: WinButton) {
+        defer { dismissContextControls() }
+        NSRunningApplication(processIdentifier: button.win.pid)?.terminate()
+        stateDidChange?()
     }
 
     @objc private func click(_ sender: WinButton) {
         guard let homeScreen else { return }
+        let wasStowed = sender.win.stowed
         raise(sender.win, onto: homeScreen)
+        guard wasStowed else { return }
+
+        // Let the restored window use the same short Dock-style departure
+        // animation as the system Dock. The exact Genie shader is private, so
+        // this is a geometry equivalent that collapses toward the configured
+        // edge; Scale collapses toward the icon's center.
+        let original = sender.frame
+        let collapsed: NSRect
+        if body.style.minimizeEffect == "scale" {
+            collapsed = NSRect(x: original.midX, y: original.midY,
+                               width: 1, height: 1)
+        } else {
+            switch body.style.edge {
+            case .bottom:
+                collapsed = NSRect(x: original.minX, y: 0, width: original.width, height: 1)
+            case .left:
+                collapsed = NSRect(x: body.bounds.minX, y: original.minY, width: 1, height: original.height)
+            case .right:
+                collapsed = NSRect(x: body.bounds.maxX, y: original.minY, width: 1, height: original.height)
+            }
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = body.style.animationDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            sender.animator().frame = collapsed
+            sender.animator().alphaValue = 0
+        }
     }
 }
 
 // MARK: - App
+
+private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
+                                   notification: CFString,
+                                   refcon: UnsafeMutableRawPointer?) {
+    guard let refcon else { return }
+    let controller = Unmanaged<Controller>.fromOpaque(refcon).takeUnretainedValue()
+    MainActor.assumeIsolated {
+        controller.scheduleTick()
+    }
+}
 
 @MainActor final class Controller: NSObject, NSApplicationDelegate {
     private var docks: [CGDirectDisplayID: DockPanel] = [:]
@@ -365,8 +1153,11 @@ final class DockPanel: NSPanel {
     private var hoverMonitor: Any?
     private var observers: [pid_t: AXObserver] = [:]
     private var trustTimer: Timer?
+    private var locations: [WindowID: WindowLocation] = [:]
+    private var tickPending = false
 
     func applicationDidFinishLaunching(_: Notification) {
+        NSApp.applicationIconImage = runtimeIcon()
         guard AXIsProcessTrustedWithOptions(
             ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         ) else {
@@ -388,8 +1179,8 @@ final class DockPanel: NSPanel {
 
     private func start() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "dock.rectangle",
-                                     accessibilityDescription: "SibDocks")
+        item.button?.image = menuIcon()
+        item.button?.toolTip = "SibDocks"
         let menu = NSMenu()
         menu.addItem(withTitle: "Quit SibDocks",
                      action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -411,15 +1202,105 @@ final class DockPanel: NSPanel {
             }
         }
 
-        // ponytail: 1s poll. Swap for AX notification observers only if CPU shows up.
+        // Keep a low-frequency reconciliation pass for apps that do not emit
+        // the AX notifications needed to describe minimization reliably.
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
         tick()
     }
 
+    private func menuIcon() -> NSImage {
+        let image = NSImage(systemSymbolName: "dock.rectangle",
+                            accessibilityDescription: "SibDocks")!
+        image.isTemplate = true
+        return image
+    }
+
+    private func runtimeIcon() -> NSImage {
+        guard let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+              let image = NSImage(contentsOf: url)
+        else { return menuIcon() }
+        return image
+    }
+
+    func scheduleTick() {
+        guard !tickPending else { return }
+        tickPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.tickPending = false
+            self.tick()
+        }
+    }
+
+    func applicationWillTerminate(_: Notification) {
+        if let hoverMonitor {
+            NSEvent.removeMonitor(hoverMonitor)
+        }
+        timer?.invalidate()
+        trustTimer?.invalidate()
+        for observer in observers.values {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        }
+        observers.removeAll()
+        docks.values.forEach { $0.orderOut(nil) }
+    }
+
+    private func updateAccessibilityObservers(for windows: [WinInfo]) {
+        let pids = Set(windows.map(\.pid))
+        for pid in Array(observers.keys) where !pids.contains(pid) {
+            if let observer = observers.removeValue(forKey: pid) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+            }
+        }
+
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for pid in pids where observers[pid] == nil {
+            var observer: AXObserver?
+            guard AXObserverCreate(pid, accessibilityCallback, &observer) == .success,
+                  let observer else { continue }
+            let appElement = AXUIElementCreateApplication(pid)
+            for notification in [
+                kAXWindowCreatedNotification,
+                kAXUIElementDestroyedNotification,
+                kAXApplicationHiddenNotification,
+                kAXApplicationShownNotification
+            ] {
+                AXObserverAddNotification(observer, appElement, notification as CFString, refcon)
+            }
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+            observers[pid] = observer
+        }
+
+        // Value changes are where most applications report AXMinimized. Add
+        // the window-level observers after the app observer has been created.
+        for window in windows {
+            guard let observer = observers[window.pid] else { continue }
+            let notifications: [String] = [
+                kAXUIElementDestroyedNotification,
+                kAXMovedNotification,
+                kAXResizedNotification,
+                kAXTitleChangedNotification,
+                kAXValueChangedNotification
+            ]
+            for notification in notifications {
+                AXObserverAddNotification(observer, window.element, notification as CFString, refcon)
+            }
+        }
+    }
+
     private func tick() {
-        let wins = listWindows()
+        let wins = listWindows(using: &locations)
+        updateAccessibilityObservers(for: wins)
+        let liveIDs = Set(wins.map(\.id))
+        let now = Date()
+        // Keep a briefly missing app's last display so an AX timeout during a
+        // minimize transition cannot strand its tile. Closed windows are
+        // discarded after the grace period.
+        locations = locations.filter {
+            liveIDs.contains($0.key) || now.timeIntervalSince($0.value.lastSeen) < 30
+        }
 
         var byScreen: [CGDirectDisplayID: [WinInfo]] = [:]
         for w in wins {
@@ -427,17 +1308,25 @@ final class DockPanel: NSPanel {
             byScreen[id, default: []].append(w)
         }
         let style = DockStyle.current()
-        // That display already has a dock: the real one.
-        let taken = realDockScreen()
-        let live = Set(NSScreen.screens.compactMap(\.displayID)).subtracting([taken].compactMap { $0 })
-        for (id, dock) in docks where !live.contains(id) {
+        // The system Dock belongs to the main display. Extended displays get
+        // one SibDocks strip each. If the real Dock is temporarily visiting an
+        // extended display, leave that display alone to avoid stacking two
+        // glass bars on top of one another.
+        let primaryID = NSScreen.screens.first?.displayID
+        let taken = realDockScreen().flatMap { $0 == primaryID ? nil : $0 }
+        let live = Set(NSScreen.screens.compactMap(\.displayID))
+            .subtracting([primaryID, taken].compactMap { $0 })
+        for (id, dock) in Array(docks) where !live.contains(id) {
             dock.orderOut(nil); docks[id] = nil
         }
         for screen in NSScreen.screens {
-            guard let id = screen.displayID, id != taken else { continue }
+            guard let id = screen.displayID, live.contains(id) else { continue }
             let dock = docks[id] ?? {
                 let d = DockPanel(); docks[id] = d; return d
             }()
+            if dock.stateDidChange == nil {
+                dock.stateDidChange = { [weak self] in self?.scheduleTick() }
+            }
             dock.update(byScreen[id] ?? [], style: style, on: screen)
         }
     }
@@ -457,29 +1346,32 @@ if CommandLine.arguments.contains("--selftest") {
     }
     // Magnification layout: tiles must never overlap, the tile under the
     // cursor must be the biggest, and no cursor must mean no magnification.
-    let cv = DockContentView(frame: NSRect(x: 0, y: 0, width: 600, height: 100))
+    // Give vertical docks the same usable axis as the horizontal case. The
+    // real panel compresses only when a display genuinely has too many tiles.
+    let cv = DockContentView(frame: NSRect(x: 0, y: 0, width: 600, height: 600))
     for edge in [DockEdge.bottom, .left, .right] {
         cv.style = DockStyle(tile: 42, large: 72, magnify: true, edge: edge)
         cv.subviews.compactMap { $0 as? WinButton }.forEach { $0.removeFromSuperview() }
         for _ in 0..<6 { cv.addSubview(WinButton()) }
 
-        let axisMid: CGFloat = cv.style.isVertical ? 50 : 300
+        let axisMid: CGFloat = 300
         cv.cursor = axisMid
         cv.layoutTiles()
         let rects = cv.tiles.map(\.frame)
         let along: (NSRect) -> CGFloat = { cv.style.isVertical ? $0.midY : $0.midX }
+        let extent: (NSRect) -> CGFloat = { cv.style.isVertical ? $0.height : $0.width }
         for (a, b) in zip(rects, rects.dropFirst()) {
-            let gap = abs(along(b) - along(a)) - (a.width + b.width) / 2
+            let gap = abs(along(b) - along(a)) - (extent(a) + extent(b)) / 2
             assert(gap > -0.01, "magnified tiles overlap on \(edge)")
         }
-        let widest = rects.map(\.width).max()!
+        let widest = rects.map(extent).max()!
         let nearest = rects.min { abs(along($0) - axisMid) < abs(along($1) - axisMid) }!
-        assert(nearest.width == widest, "cursor tile is not the largest on \(edge)")
+        assert(extent(nearest) == widest, "cursor tile is not the largest on \(edge)")
         assert(widest <= 72.01, "magnified past largesize on \(edge)")
 
         cv.cursor = nil
         cv.layoutTiles()
-        assert(cv.tiles.allSatisfy { abs($0.frame.width - 42) < 0.01 },
+        assert(cv.tiles.allSatisfy { abs(extent($0.frame) - 42) < 0.01 },
                "tiles magnified with no cursor on \(edge)")
     }
     print("layout ok (bottom/left/right, magnified + resting)")

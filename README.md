@@ -1,15 +1,17 @@
 # SibDocks
 
-A dock per display. Each screen gets its own strip showing only the windows
-currently on that screen; clicking an icon raises that window.
+A dock for every extended display. Each external screen gets its own strip
+showing only the windows currently assigned to that screen; clicking an icon
+raises that window on the display whose strip was clicked.
 
 macOS gives you one Dock that follows the active display and lists *apps*.
-SibDocks gives you one strip per display that lists *windows*, and only the
-ones living on that display.
+SibDocks gives you one strip per extended display that lists *windows*, and
+only the ones living on that display.
 
-Whichever display the real Dock is currently on does not get a SibDocks
-strip. That screen already has a dock. When you move the real Dock to another
-display, the strips rearrange themselves to match.
+The main display continues to use the system Dock. If the system Dock is
+temporarily visiting an external display, SibDocks leaves that display clear
+until the system Dock moves away, preventing two docks from being stacked on
+the same edge.
 
 ## Requirements
 
@@ -41,11 +43,19 @@ through the menu bar icon → **Quit SibDocks**, or from a terminal:
 pkill -x SibDocks
 ```
 
+SibDocks uses the native `dock.rectangle` symbol for its application and menu
+bar icon. The bundle icon is rendered directly from that same SF Symbol during
+each build, so it stays visually identical rather than relying on a separate
+piece of artwork.
+
 ## Minimized windows
 
-Minimizing works exactly as macOS intends: the window goes to the system Dock.
-SibDocks keeps a dimmed tile for it on the strip belonging to the screen it came
-from, and clicking that tile brings the window back **onto that screen**.
+SibDocks keeps a dimmed tile for a minimized or hidden window on the strip
+belonging to the last display where that window was visible. Clicking that tile
+brings the window back **onto the strip's display**, including when the window
+was minimized from another screen. The last display and frame are cached so
+applications that report the system Dock's frame while minimized do not cause
+the tile to jump to the wrong screen.
 
 That last part is the point of a per-screen dock. The tile you click decides
 where the window lands, so a window minimized from one display and restored from
@@ -59,8 +69,18 @@ race the restore animation.
 Windows belonging to hidden apps (⌘H) get the same dimmed treatment, and
 clicking unhides the app.
 
-Note that the display hosting the real Dock has no strip, so windows minimized
-there are reachable only from the system Dock.
+## Context menu
+
+Right-clicking a tile follows the system Dock's familiar menu shape: **Open**
+or **Show**, **Show All Windows**, an **Options** submenu with **Show in
+Finder**, then **Hide** and **Quit**. The window actions use the stored
+Accessibility element rather than trying to identify the window again.
+
+macOS does not expose a public API for removing another application's
+minimized window from the system Dock or re-parenting it into a third-party
+panel. Consequently the system Dock may also show the minimized window; the
+SibDocks tile is the authoritative per-display restore affordance available to
+an Accessibility client.
 
 ## Appearance
 
@@ -72,6 +92,9 @@ every tick, so a change shows up within a second:
 | Size | `tilesize` | Icon size, and every derived measurement below |
 | Magnification | `magnification`, `largesize` | Hover magnification with the same falloff curve |
 | Position on screen | `orientation` | Strip sits along the bottom, left, or right edge |
+| Automatically hide | `autohide`, `autohide-delay` | Reveals when the pointer reaches the configured edge |
+| Open-app indicators | `show-process-indicators` | Small status dot on each window tile |
+| Minimize animation | `mineffect` | Genie-style or scale-style tile departure |
 
 The background is `NSGlassEffectView`, the same Liquid Glass material the
 system Dock uses on macOS 26 and later, so light and dark mode come for free.
@@ -83,17 +106,17 @@ so does SibDocks (8 pad + 42 tile + 8 pad + 4 margin). They are grouped in
 
 ## How it works
 
-1. Every second, each regular running app is asked via Accessibility for its
-   `AXWindows`, keeping those with the `AXStandardWindow` subrole or a minimize
-   button. Each window is held as its `AXUIElement`, along with its title,
-   frame, and whether it is minimized or its app is hidden.
+1. Each regular running app is asked via Accessibility for its `AXWindows`,
+   keeping those with the `AXStandardWindow` subrole or a minimize button.
+   Each window is held as its `AXUIElement`, along with its title, frame, last
+   visible display, and whether it is minimized or its app is hidden.
 2. Each window's center is converted from CoreGraphics global coordinates
    (origin top-left of the primary display, y down) to Cocoa coordinates
    (origin bottom-left, y up) and matched against `NSScreen.frame`.
-3. The display hosting the real macOS Dock is skipped. The Dock draws one
-   window at the dock window level spanning exactly the display it lives on,
-   so that window's bounds identify the display to leave alone.
-4. One borderless non-activating `NSPanel` per remaining display renders that
+3. The main display is skipped because it owns the system Dock. The display
+   hosting the real macOS Dock is also skipped while the Dock is visiting an
+   external display, so the two strips never overlap.
+4. One borderless non-activating `NSPanel` per remaining extended display renders that
    screen's windows as app icons on a glass strip along the configured edge.
    A panel with no windows hides itself.
 5. A global mouse monitor drives magnification and toggles
@@ -101,7 +124,10 @@ so does SibDocks (8 pad + 42 tile + 8 pad + 4 margin). They are grouped in
    icons but stays click-through over the transparent headroom that magnified
    icons need. Tracking areas would not work here, since a click-through panel
    does not receive its own events.
-6. Clicking an icon moves the window onto that strip's screen, unhides the app,
+6. AX observers wake the controller immediately for window creation, movement,
+   title, minimize, and app-hidden changes; a one-second poll remains as a
+   recovery path for applications that do not emit useful AX notifications.
+   Clicking an icon moves the window onto that strip's screen, unhides the app,
    clears `AXMinimized`, sets `AXMain`, performs `AXRaise`, and activates the
    app. It acts on the stored element directly, so there is no window-matching
    step to get wrong.
@@ -169,26 +195,24 @@ that display arrangement. Run this before filing anything.
 
 ## Known limits
 
-- **One second of lag.** State comes from a poll, not from AX notifications.
-  Marked `ponytail:` in the source. Swap in observers if the poll ever shows
-  up in Activity Monitor.
+- **The system Dock still owns minimized-window tiles.** Public macOS APIs do
+  not allow SibDocks to remove or re-parent another app's minimized window.
+  SibDocks mirrors the state and provides correct per-display restoration; it
+  cannot suppress the system Dock's copy without private, fragile APIs.
 - **One button per window, no grouping.** With enough windows open the strip
   runs off the edge of the screen. Group by app when that starts to bite.
 - **Raise only.** No minimize, close, or quit from the strip.
-- **Three Dock settings, not all of them.** Size, magnification, and position
-  are tracked. Auto-hide, minimise effects, running-app indicators, and the
-  recents section are not.
+- **Some Dock details remain private.** Size, magnification, position, and
+  auto-hide are tracked. Minimise effects, running-app indicators, and the
+  recents section are not exposed to third-party apps.
 - **Magnification is an approximation.** Each tile is scaled from its resting
   centre and the magnified widths are then laid out cumulatively. The real Dock
   solves position and width together. Close, not identical.
-- **Auto-hide defeats the Dock check.** A hidden Dock has no on-screen window
-  to find, so that display gets a SibDocks strip too and the two overlap when
-  the real Dock slides up. Fine if you do not use auto-hide.
+- **Auto-hide detection.** When the system Dock is hidden, its on-screen window
+  is unavailable, so SibDocks relies on the primary-display rule and its own
+  auto-hide preference mirror until the Dock reappears.
 - **No fullscreen handling.** The panel is `fullScreenAuxiliary`, so it floats
   over fullscreen windows rather than hiding.
-- **Minimized windows live in the system Dock, not on the strip.** They appear
-  in both places: a real Dock tile and a dimmed SibDocks tile. Removing them
-  from the system Dock is not possible with public APIs.
 - **Other Spaces are not filtered.** A window on another Space is neither
   minimized nor hidden, so it appears on its screen's strip as a normal tile.
 
