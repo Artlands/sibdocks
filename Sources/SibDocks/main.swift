@@ -483,7 +483,9 @@ final class DockPanel: NSPanel {
         body.layoutAnimationDuration = style.animationDuration
 
         hideWorkItem?.cancel()
-        guard !systemDockIsPresent else {
+        // Nothing to point at: no tiles on this display, or the real Dock is here.
+        guard !systemDockIsPresent, !wins.isEmpty else {
+            body.tiles.forEach { $0.removeFromSuperview() }
             alphaValue = 1
             orderOut(nil)
             return
@@ -514,14 +516,7 @@ final class DockPanel: NSPanel {
         let depth = max(style.thickness,
                         style.pad + largestIcon + style.indicatorLane(for: largestIcon) + style.pad)
         let n = CGFloat(wins.count)
-        // Keep an empty display's dock visible. The system Dock remains a
-        // usable glass strip even when there are no app tiles to show, and a
-        // minimum tile-sized length gives the per-display dock a stable anchor
-        // for the next window that appears.
-        let contentLength = n > 0
-            ? n * style.tile * style.maxScale + (n - 1) * style.gap
-            : style.tile
-        let length = contentLength + 2 * style.pad
+        let length = n * style.tile * style.maxScale + (n - 1) * style.gap + 2 * style.pad
         let f = screen.frame
 
         let frame: NSRect = switch style.edge {
