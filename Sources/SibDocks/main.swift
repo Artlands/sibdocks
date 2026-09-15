@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 
 // MARK: - Window enumeration
 
@@ -66,8 +67,14 @@ func setAXPosition(_ el: AXUIElement, _ p: CGPoint) {
 
 /// NSScreen.frame in CoreGraphics coords, so it can be compared with window
 /// frames without flipping every value at the call site.
+func primaryScreen() -> NSScreen? {
+    let mainDisplay = CGMainDisplayID()
+    return NSScreen.screens.first(where: { $0.displayID == mainDisplay })
+        ?? NSScreen.screens.first
+}
+
 func cgFrame(of screen: NSScreen) -> CGRect {
-    let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+    let primaryTop = primaryScreen()?.frame.maxY ?? 0
     let f = screen.frame
     return CGRect(x: f.minX, y: primaryTop - f.maxY, width: f.width, height: f.height)
 }
@@ -160,7 +167,7 @@ func cgFrame(of screen: NSScreen) -> CGRect {
 
 /// CG global point (y down, from primary top) -> Cocoa global point (y up, from primary bottom).
 func cocoaPoint(_ p: CGPoint) -> CGPoint {
-    let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+    let primaryTop = primaryScreen()?.frame.maxY ?? 0
     return CGPoint(x: p.x, y: primaryTop - p.y)
 }
 
@@ -190,7 +197,15 @@ func realDockScreen() -> CGDirectDisplayID? {
               let bd = d[kCGWindowBounds as String],
               let bounds = bd as? NSDictionary,
               let rect = CGRect(dictionaryRepresentation: bounds),
-              let id = screenContaining(rect)?.displayID
+              let id = NSScreen.screens.first(where: { screen in
+                  guard let displayID = screen.displayID else { return false }
+                  // Window bounds and CGDisplayBounds share Quartz's global
+                  // top-left coordinate system. Avoid the Cocoa/Quartz flip
+                  // used for AX window mapping, which can misidentify the
+                  // Dock during a display handoff.
+                  return CGDisplayBounds(displayID).contains(
+                      CGPoint(x: rect.midX, y: rect.midY))
+              })?.displayID
         else { continue }
         return id
     }
@@ -424,236 +439,6 @@ final class DockContentView: NSView {
         }
     }
 
-    /// True where the panel should swallow clicks. Everywhere else it is a
-    /// transparent hole and must not block the windows underneath.
-    func isInteractive(_ p: NSPoint) -> Bool {
-        glass.frame.contains(p) || tiles.contains { $0.frame.contains(p) }
-    }
-}
-
-// MARK: - Dock contextual menu
-
-private enum DockMenuEntry {
-    case action(title: String, enabled: Bool, hasSubmenu: Bool, handler: () -> Void)
-    case separator
-}
-
-/// A compact contextual surface using the system menu material. NSMenu is
-/// correct for normal application menus, but the Dock presents its contextual
-/// controls in a glass pop-up with tighter rows and rounded hover selection.
-private final class DockContextMenuPanel: NSPanel {
-    init(content: NSView) {
-        super.init(contentRect: content.bounds,
-                   styleMask: [.borderless, .nonactivatingPanel],
-                   backing: .buffered, defer: false)
-        contentView = content
-        level = .popUpMenu
-        isFloatingPanel = true
-        backgroundColor = .clear
-        isOpaque = false
-        hasShadow = true
-        hidesOnDeactivate = true
-        collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary]
-    }
-}
-
-private final class DockContextMenuRow: NSControl {
-    private let text: String
-    private let hasSubmenu: Bool
-    private let handler: () -> Void
-    private var trackingArea: NSTrackingArea?
-    private var hovered = false { didSet { needsDisplay = true } }
-    private var pressed = false { didSet { needsDisplay = true } }
-
-    init(title: String, enabled: Bool, hasSubmenu: Bool, handler: @escaping () -> Void) {
-        self.text = title
-        self.hasSubmenu = hasSubmenu
-        self.handler = handler
-        super.init(frame: .zero)
-        isEnabled = enabled
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseEnteredAndExited],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        guard isEnabled else { return }
-        hovered = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hovered = false
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard isEnabled else { return }
-        pressed = true
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        defer { pressed = false }
-        guard isEnabled, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        handler()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        if hovered || pressed {
-            NSColor.selectedContentBackgroundColor.withAlphaComponent(pressed ? 0.95 : 0.78).setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 6, yRadius: 6).fill()
-        }
-
-        let style = NSMutableParagraphStyle()
-        style.alignment = .left
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
-            .foregroundColor: isEnabled ? NSColor.labelColor : NSColor.disabledControlTextColor,
-            .paragraphStyle: style
-        ]
-        let textRect = bounds.insetBy(dx: 14, dy: 0).offsetBy(dx: 0, dy: 7)
-        (text as NSString).draw(in: textRect, withAttributes: attributes)
-
-        guard hasSubmenu else { return }
-        let chevron = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)!
-        let rect = NSRect(x: bounds.maxX - 22, y: bounds.midY - 5, width: 10, height: 10)
-        chevron.draw(in: rect, from: .zero, operation: .sourceOver,
-                     fraction: isEnabled ? 0.7 : 0.3, respectFlipped: true, hints: nil)
-    }
-}
-
-private final class DockMenuSeparator: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.separatorColor.withAlphaComponent(0.65).setFill()
-        NSBezierPath(rect: NSRect(x: 10, y: bounds.midY, width: bounds.width - 20, height: 1)).fill()
-    }
-}
-
-private final class DockContextMenuView: NSView {
-    private let glass = NSVisualEffectView()
-    private let drawsOwnBackground: Bool
-    private let entries: [DockMenuEntry]
-    private let padding: CGFloat = 6
-    private let rowHeight: CGFloat = 30
-    private let separatorHeight: CGFloat = 9
-
-    init(entries: [DockMenuEntry], drawsOwnBackground: Bool = true) {
-        self.entries = entries
-        self.drawsOwnBackground = drawsOwnBackground
-        let height = entries.reduce(CGFloat(12)) { partial, entry in
-            partial + (entry.isSeparator ? 9 : 30)
-        }
-        super.init(frame: NSRect(x: 0, y: 0, width: 224, height: height))
-        wantsLayer = true
-        if drawsOwnBackground {
-            glass.material = .menu
-            glass.blendingMode = .behindWindow
-            glass.state = .active
-            glass.wantsLayer = true
-            glass.layer?.cornerRadius = 12
-            glass.layer?.masksToBounds = true
-            addSubview(glass)
-        }
-
-        var top = bounds.maxY - padding
-        for entry in entries {
-            switch entry {
-            case let .action(title, enabled, hasSubmenu, handler):
-                top -= rowHeight
-                let row = DockContextMenuRow(title: title, enabled: enabled,
-                                             hasSubmenu: hasSubmenu, handler: handler)
-                row.frame = NSRect(x: padding, y: top, width: bounds.width - 2 * padding,
-                                   height: rowHeight)
-                addSubview(row)
-            case .separator:
-                top -= separatorHeight
-                let separator = DockMenuSeparator(frame: NSRect(x: 0, y: top,
-                                                                 width: bounds.width,
-                                                                 height: separatorHeight))
-                addSubview(separator)
-            }
-        }
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func layout() {
-        super.layout()
-        if drawsOwnBackground { glass.frame = bounds }
-    }
-}
-
-/// The Dock's context menu is not a generic popover: its bubble has a short,
-/// curved pointer that touches the selected icon. Draw that silhouette
-/// directly so the panel has the same white surface, rim, and pointer shape.
-private final class DockContextBubbleView: NSView {
-    private let menuContent: DockContextMenuView
-    private let pointerX: CGFloat
-    private let pointerHeight: CGFloat = 18
-    private let cornerRadius: CGFloat = 20
-
-    init(menu: DockContextMenuView, pointerX: CGFloat) {
-        self.menuContent = menu
-        self.pointerX = min(max(pointerX, 34), menu.bounds.width - 34)
-        super.init(frame: NSRect(x: 0, y: 0, width: menu.bounds.width,
-                                 height: menu.bounds.height + pointerHeight))
-        menuContent.frame = NSRect(x: 0, y: pointerHeight, width: menu.bounds.width,
-                                   height: menu.bounds.height)
-        addSubview(menuContent)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let body = NSRect(x: 0, y: pointerHeight, width: bounds.width,
-                          height: bounds.height - pointerHeight)
-        let path = NSBezierPath()
-        let r = cornerRadius
-        let leftTail = pointerX - 13
-        let rightTail = pointerX + 13
-
-        path.move(to: NSPoint(x: body.minX + r, y: body.minY))
-        path.line(to: NSPoint(x: leftTail, y: body.minY))
-        path.curve(to: NSPoint(x: pointerX, y: 0),
-                   controlPoint1: NSPoint(x: leftTail + 5, y: body.minY),
-                   controlPoint2: NSPoint(x: pointerX - 7, y: 4))
-        path.curve(to: NSPoint(x: rightTail, y: body.minY),
-                   controlPoint1: NSPoint(x: pointerX + 7, y: 4),
-                   controlPoint2: NSPoint(x: rightTail - 5, y: body.minY))
-        path.line(to: NSPoint(x: body.maxX - r, y: body.minY))
-        path.curve(to: NSPoint(x: body.maxX, y: body.minY + r),
-                   controlPoint1: NSPoint(x: body.maxX - r * 0.45, y: body.minY),
-                   controlPoint2: NSPoint(x: body.maxX, y: body.minY + r * 0.45))
-        path.line(to: NSPoint(x: body.maxX, y: body.maxY - r))
-        path.curve(to: NSPoint(x: body.maxX - r, y: body.maxY),
-                   controlPoint1: NSPoint(x: body.maxX, y: body.maxY - r * 0.45),
-                   controlPoint2: NSPoint(x: body.maxX - r * 0.45, y: body.maxY))
-        path.line(to: NSPoint(x: body.minX + r, y: body.maxY))
-        path.curve(to: NSPoint(x: body.minX, y: body.maxY - r),
-                   controlPoint1: NSPoint(x: body.minX + r * 0.45, y: body.maxY),
-                   controlPoint2: NSPoint(x: body.minX, y: body.maxY - r * 0.45))
-        path.line(to: NSPoint(x: body.minX, y: body.minY + r))
-        path.curve(to: NSPoint(x: body.minX + r, y: body.minY),
-                   controlPoint1: NSPoint(x: body.minX, y: body.minY + r * 0.45),
-                   controlPoint2: NSPoint(x: body.minX + r * 0.45, y: body.minY))
-        path.close()
-
-        NSColor(calibratedWhite: 0.985, alpha: 0.97).setFill()
-        path.fill()
-        NSColor(calibratedWhite: 0.60, alpha: 0.70).setStroke()
-        path.lineWidth = 1
-        path.stroke()
-    }
-}
-
-private extension DockMenuEntry {
-    var isSeparator: Bool {
-        if case .separator = self { return true }
-        return false
-    }
 }
 
 final class DockPanel: NSPanel {
@@ -661,12 +446,10 @@ final class DockPanel: NSPanel {
     private var shownStyle: DockStyle?
     private var shownScreenID: CGDirectDisplayID?
     private var shownScreenFrame: NSRect = .zero
+    private var shownSystemDockSuppressed = false
     /// The display this strip belongs to; clicking a tile sends the window here.
     private var homeScreen: NSScreen?
     private var hideWorkItem: DispatchWorkItem?
-    private var contextPanels: [DockContextMenuPanel] = []
-    private var contextEventMonitor: Any?
-    private var contextPopover: NSPopover?
     private var body: DockContentView { contentView as! DockContentView }
     var stateDidChange: (() -> Void)?
 
@@ -684,19 +467,23 @@ final class DockPanel: NSPanel {
         contentView = DockContentView()
     }
 
-    func update(_ wins: [WinInfo], style: DockStyle, on screen: NSScreen) {
+    func update(_ wins: [WinInfo], style: DockStyle, on screen: NSScreen,
+                systemDockIsPresent: Bool = false) {
         guard wins != shown || style != shownStyle
                 || screen.displayID != shownScreenID
-                || screen.frame != shownScreenFrame else { return }
+                || screen.frame != shownScreenFrame
+                || systemDockIsPresent != shownSystemDockSuppressed else { return }
         shown = wins
         shownStyle = style
         shownScreenID = screen.displayID
         shownScreenFrame = screen.frame
+        shownSystemDockSuppressed = systemDockIsPresent
         homeScreen = screen
         body.style = style
         body.layoutAnimationDuration = style.animationDuration
 
-        guard !wins.isEmpty else {
+        hideWorkItem?.cancel()
+        guard !systemDockIsPresent else {
             alphaValue = 1
             orderOut(nil)
             return
@@ -727,7 +514,14 @@ final class DockPanel: NSPanel {
         let depth = max(style.thickness,
                         style.pad + largestIcon + style.indicatorLane(for: largestIcon) + style.pad)
         let n = CGFloat(wins.count)
-        let length = n * style.tile * style.maxScale + (n - 1) * style.gap + 2 * style.pad
+        // Keep an empty display's dock visible. The system Dock remains a
+        // usable glass strip even when there are no app tiles to show, and a
+        // minimum tile-sized length gives the per-display dock a stable anchor
+        // for the next window that appears.
+        let contentLength = n > 0
+            ? n * style.tile * style.maxScale + (n - 1) * style.gap
+            : style.tile
+        let length = contentLength + 2 * style.pad
         let f = screen.frame
 
         let frame: NSRect = switch style.edge {
@@ -747,8 +541,8 @@ final class DockPanel: NSPanel {
         }
     }
 
-    /// Follow the cursor for magnification, and stay click-through everywhere
-    /// the dock is not actually drawn.
+    /// Follow the cursor for magnification while the visible dock panel keeps
+    /// mouse events enabled for reliable primary and secondary clicks.
     func hover(_ screenPoint: NSPoint) {
         guard !shown.isEmpty else { return }
         if body.style.autoHide {
@@ -780,10 +574,6 @@ final class DockPanel: NSPanel {
                 body.layoutTiles(animated: true)
             }
         }
-        // The panel is deliberately narrow, and keeping it mouse-enabled is
-        // more reliable than dynamically switching a non-activating panel to
-        // click-through just as a secondary click begins.
-        ignoresMouseEvents = false
     }
 
     private func nearEdge(_ point: NSPoint) -> Bool {
@@ -800,7 +590,6 @@ final class DockPanel: NSPanel {
     private func reveal(animated: Bool) {
         hideWorkItem?.cancel()
         guard !isVisible else { return }
-        ignoresMouseEvents = false
         alphaValue = 0
         orderFront(nil)
         if animated {
@@ -824,61 +613,10 @@ final class DockPanel: NSPanel {
         DispatchQueue.main.asyncAfter(deadline: .now() + body.style.autoHideDelay, execute: work)
     }
 
-    /// An NSPopover supplies the Dock-style speech-bubble pointer below the
-    /// menu while AppKit continues to own secondary-click tracking.
-    private func showContextPopover(for button: WinButton) {
-        let app = NSRunningApplication(processIdentifier: button.win.pid)
-        let showTitle = button.win.stowed ? "Open" : "Show"
-        presentContextPopover(entries: [
-            .action(title: showTitle, enabled: true, hasSubmenu: false) { [weak self] in
-                self?.contextShow(button)
-            },
-            .action(title: "Show All Windows", enabled: app != nil, hasSubmenu: false) { [weak self] in
-                self?.contextShowAll(button)
-            },
-            .separator,
-            .action(title: "Options", enabled: true, hasSubmenu: true) { [weak self] in
-                self?.showOptionsPopover(for: button)
-            },
-            .separator,
-            .action(title: "Hide", enabled: app != nil && !(app?.isHidden ?? true), hasSubmenu: false) { [weak self] in
-                self?.contextHide(button)
-            },
-            .action(title: "Quit", enabled: app != nil, hasSubmenu: false) { [weak self] in
-                self?.contextQuit(button)
-            }
-        ], for: button)
-    }
-
-    private func showOptionsPopover(for button: WinButton) {
-        let app = NSRunningApplication(processIdentifier: button.win.pid)
-        presentContextPopover(entries: [
-            .action(title: "Show in Finder", enabled: app?.bundleURL != nil, hasSubmenu: false) { [weak self] in
-                self?.contextShowInFinder(button)
-            }
-        ], for: button)
-    }
-
-    private func presentContextPopover(entries: [DockMenuEntry], for button: WinButton) {
-        contextPopover?.performClose(nil)
-        let content = DockContextMenuView(entries: entries, drawsOwnBackground: false)
-        let controller = NSViewController()
-        controller.view = content
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.appearance = NSAppearance(named: .aqua)
-        popover.contentViewController = controller
-        popover.contentSize = content.bounds.size
-        contextPopover = popover
-        // .maxY puts the popover above a bottom-edge dock tile, leaving its
-        // native arrow below the bubble and pointing directly at the icon.
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
-    }
-
-    /// Use AppKit's native contextual-menu presentation for event tracking and
-    /// the system Dock's light frosted Aqua surface. Do not inherit the dark
-    /// appearance of an app behind the strip: Dock contextual menus stay light
-    /// and receive their rounded outline and shadow from AppKit.
+    /// Use AppKit's native contextual-menu presentation for both tracking and
+    /// rendering. The menu inherits the user's current system appearance, so
+    /// it stays consistent with macOS instead of maintaining a second custom
+    /// menu surface in SibDocks.
     private func nativeContextMenu(for button: WinButton) -> NSMenu {
         let app = NSRunningApplication(processIdentifier: button.win.pid)
         let menu = NSMenu()
@@ -942,135 +680,12 @@ final class DockPanel: NSPanel {
         contextQuit(button)
     }
 
-    private func showContextMenu(for button: WinButton) {
-        dismissContextMenus()
-        let app = NSRunningApplication(processIdentifier: button.win.pid)
-        let showTitle = button.win.stowed ? "Open" : "Show"
-        presentContextMenu(entries: [
-            .action(title: showTitle, enabled: true, hasSubmenu: false) { [weak self] in
-                self?.contextShow(button)
-            },
-            .action(title: "Show All Windows", enabled: app != nil, hasSubmenu: false) { [weak self] in
-                self?.contextShowAll(button)
-            },
-            .separator,
-            .action(title: "Options", enabled: true, hasSubmenu: true) { [weak self] in
-                self?.showOptionsMenu(for: button)
-            },
-            .separator,
-            .action(title: "Hide", enabled: app != nil && !(app?.isHidden ?? true), hasSubmenu: false) { [weak self] in
-                self?.contextHide(button)
-            },
-            .action(title: "Quit", enabled: app != nil, hasSubmenu: false) { [weak self] in
-                self?.contextQuit(button)
-            }
-        ], for: button, alongside: nil)
-    }
-
-    private func showOptionsMenu(for button: WinButton) {
-        guard let root = contextPanels.first else { return }
-        contextPanels.dropFirst().forEach { $0.orderOut(nil) }
-        contextPanels = [root]
-        let app = NSRunningApplication(processIdentifier: button.win.pid)
-        presentContextMenu(entries: [
-            .action(title: "Show in Finder", enabled: app?.bundleURL != nil, hasSubmenu: false) { [weak self] in
-                self?.contextShowInFinder(button)
-            }
-        ], for: button, alongside: root.frame)
-    }
-
-    private func presentContextMenu(entries: [DockMenuEntry], for button: WinButton,
-                                    alongside parentFrame: NSRect?) {
-        let panel: DockContextMenuPanel
-
-        // The bottom Dock's menu has a tail below the bubble. Position its
-        // tip over the icon, then keep the whole bubble inside the display.
-        if parentFrame == nil, body.style.edge == .bottom, let window = button.window {
-            let menu = DockContextMenuView(entries: entries, drawsOwnBackground: false)
-            let tile = window.convertToScreen(button.convert(button.bounds, to: nil))
-            let tileCenter = NSPoint(x: tile.midX, y: tile.midY)
-            let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(tileCenter) })
-                ?? homeScreen ?? NSScreen.main
-            guard let visible = screen?.visibleFrame else { return }
-            let desiredPointerOffset: CGFloat = 54
-            let x = min(max(tile.midX - desiredPointerOffset, visible.minX + 6),
-                        visible.maxX - menu.bounds.width - 6)
-            let bubble = DockContextBubbleView(menu: menu, pointerX: tile.midX - x)
-            let size = bubble.bounds.size
-            let y = min(max(tile.maxY, visible.minY + 6), visible.maxY - size.height - 6)
-            panel = DockContextMenuPanel(content: bubble)
-            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
-        } else {
-            let content = DockContextMenuView(entries: entries)
-            let size = content.bounds.size
-            let origin: NSPoint
-            if let parentFrame {
-                origin = NSPoint(x: parentFrame.maxX - 7, y: parentFrame.maxY - size.height - 4)
-            } else if let window = button.window {
-                let tile = window.convertToScreen(button.convert(button.bounds, to: nil))
-                switch body.style.edge {
-                case .bottom: origin = NSPoint(x: tile.midX - size.width / 2, y: tile.maxY + 8)
-                case .left: origin = NSPoint(x: tile.maxX + 8, y: tile.midY - size.height / 2)
-                case .right: origin = NSPoint(x: tile.minX - size.width - 8, y: tile.midY - size.height / 2)
-                }
-            } else {
-                origin = NSEvent.mouseLocation
-            }
-            let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(origin) })
-                ?? homeScreen ?? NSScreen.main
-            guard let visible = screen?.visibleFrame else { return }
-            let x = min(max(origin.x, visible.minX + 6), visible.maxX - size.width - 6)
-            let y = min(max(origin.y, visible.minY + 6), visible.maxY - size.height - 6)
-            panel = DockContextMenuPanel(content: content)
-            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
-        }
-        contextPanels.append(panel)
-        panel.orderFrontRegardless()
-        installContextDismissMonitor()
-    }
-
-    private func installContextDismissMonitor() {
-        guard contextEventMonitor == nil else { return }
-        contextEventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-        ) { [weak self] event in
-            guard let self, !self.contextPanels.isEmpty else { return event }
-            let point: NSPoint
-            if let window = event.window {
-                point = window.convertToScreen(NSRect(origin: event.locationInWindow, size: .zero)).origin
-            } else {
-                point = NSEvent.mouseLocation
-            }
-            if !self.contextPanels.contains(where: { $0.frame.contains(point) }) {
-                self.dismissContextMenus()
-            }
-            return event
-        }
-    }
-
-    private func dismissContextMenus() {
-        contextPanels.forEach { $0.orderOut(nil) }
-        contextPanels.removeAll()
-        if let contextEventMonitor {
-            NSEvent.removeMonitor(contextEventMonitor)
-            self.contextEventMonitor = nil
-        }
-    }
-
-    private func dismissContextControls() {
-        contextPopover?.performClose(nil)
-        contextPopover = nil
-        dismissContextMenus()
-    }
-
     private func contextShow(_ button: WinButton) {
-        defer { dismissContextControls() }
         guard let homeScreen else { return }
         raise(button.win, onto: homeScreen)
     }
 
     private func contextShowAll(_ button: WinButton) {
-        defer { dismissContextControls() }
         let app = NSRunningApplication(processIdentifier: button.win.pid)
         app?.unhide()
         for window in shown where window.pid == button.win.pid {
@@ -1082,20 +697,17 @@ final class DockPanel: NSPanel {
     }
 
     private func contextShowInFinder(_ button: WinButton) {
-        defer { dismissContextControls() }
         guard let url = NSRunningApplication(processIdentifier: button.win.pid)?.bundleURL
         else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     private func contextHide(_ button: WinButton) {
-        defer { dismissContextControls() }
         NSRunningApplication(processIdentifier: button.win.pid)?.hide()
         stateDidChange?()
     }
 
     private func contextQuit(_ button: WinButton) {
-        defer { dismissContextControls() }
         NSRunningApplication(processIdentifier: button.win.pid)?.terminate()
         stateDidChange?()
     }
@@ -1146,10 +758,16 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
     }
 }
 
-@MainActor final class Controller: NSObject, NSApplicationDelegate {
+@MainActor final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var docks: [CGDirectDisplayID: DockPanel] = [:]
     private var timer: Timer?
+    private var dockOwnershipTimer: Timer?
+    /// The last display known to host the real Dock. The Dock window can be
+    /// absent while auto-hidden, so retain the last known host for that gap.
+    private var lastDockHostScreen: CGDirectDisplayID?
     private var statusItem: NSStatusItem?  // also the only way to quit an LSUIElement app
+    private var accessibilityItem: NSMenuItem?
+    private var launchAtLoginItem: NSMenuItem?
     private var hoverMonitor: Any?
     private var observers: [pid_t: AXObserver] = [:]
     private var trustTimer: Timer?
@@ -1158,6 +776,7 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.applicationIconImage = runtimeIcon()
+        installStatusItem()
         guard AXIsProcessTrustedWithOptions(
             ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         ) else {
@@ -1165,27 +784,62 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
             // Accessibility grant, so this wait is a normal part of the dev
             // loop. Poll rather than quit, so approving is the only step.
             NSLog("SibDocks: waiting for Accessibility approval...")
+            // Start the display surfaces even before permission is granted.
+            // They remain empty until Accessibility becomes trusted, but this
+            // makes the per-display dock visible and lets the app recover
+            // without requiring another launch.
+            updateAccessibilityMenuItem()
+            start()
             trustTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, AXIsProcessTrusted() else { return }
                     self.trustTimer?.invalidate()
+                    self.trustTimer = nil
+                    self.updateAccessibilityMenuItem()
                     self.start()
+                    self.tick()
                 }
             }
             return
         }
+        updateAccessibilityMenuItem()
         start()
     }
 
-    private func start() {
+    private func installStatusItem() {
+        guard statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = menuIcon()
         item.button?.toolTip = "SibDocks"
         let menu = NSMenu()
+        menu.delegate = self
+        let accessibility = NSMenuItem(
+            title: "Accessibility Access Required…",
+            action: #selector(openAccessibilitySettings(_:)),
+            keyEquivalent: ""
+        )
+        accessibility.target = self
+        menu.addItem(accessibility)
+        accessibilityItem = accessibility
+
+        let launchAtLogin = NSMenuItem(
+            title: "Start SibDocks at Login",
+            action: #selector(toggleLaunchAtLogin(_:)),
+            keyEquivalent: ""
+        )
+        launchAtLogin.target = self
+        menu.addItem(launchAtLogin)
+        launchAtLoginItem = launchAtLogin
+        updateLaunchAtLoginMenuItem()
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Quit SibDocks",
                      action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         statusItem = item
+    }
+
+    private func start() {
+        guard timer == nil else { return }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -1207,7 +861,66 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        // Moving the real Dock between displays does not reliably emit a
+        // screen-parameter notification. Check only its ownership frequently;
+        // run the expensive Accessibility reconciliation when that ownership
+        // actually changes.
+        dockOwnershipTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let current = realDockScreen() ?? self.lastDockHostScreen
+                guard current != self.lastDockHostScreen else { return }
+                self.tick()
+            }
+        }
         tick()
+    }
+
+    private func updateAccessibilityMenuItem() {
+        let trusted = AXIsProcessTrusted()
+        accessibilityItem?.title = trusted
+            ? "Accessibility Access Granted"
+            : "Accessibility Access Required…"
+        accessibilityItem?.isEnabled = !trusted
+    }
+
+    @objc private func openAccessibilitySettings(_ sender: NSMenuItem) {
+        let urls = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ]
+        for rawURL in urls {
+            guard let url = URL(string: rawURL), NSWorkspace.shared.open(url) else { continue }
+            return
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusItem?.menu else { return }
+        updateLaunchAtLoginMenuItem()
+    }
+
+    private func updateLaunchAtLoginMenuItem() {
+        launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            updateLaunchAtLoginMenuItem()
+        } catch {
+            updateLaunchAtLoginMenuItem()
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn’t update Start at Login"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     private func menuIcon() -> NSImage {
@@ -1239,6 +952,7 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
             NSEvent.removeMonitor(hoverMonitor)
         }
         timer?.invalidate()
+        dockOwnershipTimer?.invalidate()
         trustTimer?.invalidate()
         for observer in observers.values {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
@@ -1291,7 +1005,14 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
     }
 
     private func tick() {
-        let wins = listWindows(using: &locations)
+        // AX queries can wait for the per-application messaging timeout when
+        // macOS has not granted Accessibility to this binary. Do not block
+        // the main thread on every running app while waiting for approval:
+        // render the display surfaces immediately and resume enumeration as
+        // soon as the trust timer observes access.
+        let wins = AXIsProcessTrusted()
+            ? listWindows(using: &locations)
+            : []
         updateAccessibilityObservers(for: wins)
         let liveIDs = Set(wins.map(\.id))
         let now = Date()
@@ -1308,14 +1029,20 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
             byScreen[id, default: []].append(w)
         }
         let style = DockStyle.current()
-        // The system Dock belongs to the main display. Extended displays get
-        // one SibDocks strip each. If the real Dock is temporarily visiting an
-        // extended display, leave that display alone to avoid stacking two
-        // glass bars on top of one another.
-        let primaryID = NSScreen.screens.first?.displayID
-        let taken = realDockScreen().flatMap { $0 == primaryID ? nil : $0 }
-        let live = Set(NSScreen.screens.compactMap(\.displayID))
-            .subtracting([primaryID, taken].compactMap { $0 })
+        // The display currently hosting the system Dock is left to it. Every
+        // other display gets a SibDocks strip, including the primary display
+        // after the system Dock moves to an extended display.
+        let primaryID = primaryScreen()?.displayID
+        let screenIDs = Set(NSScreen.screens.compactMap(\.displayID))
+        let detectedDockHost = realDockScreen()
+        let dockHost = detectedDockHost
+            ?? (lastDockHostScreen.flatMap { screenIDs.contains($0) ? $0 : nil })
+            ?? primaryID
+        lastDockHostScreen = dockHost
+        // Keep a panel alive while the real Dock visits its display. This
+        // preserves the panel's state and lets the same panel be revealed as
+        // soon as the real Dock leaves, instead of relying on reconstruction.
+        let live = screenIDs.subtracting([dockHost].compactMap { $0 })
         for (id, dock) in Array(docks) where !live.contains(id) {
             dock.orderOut(nil); docks[id] = nil
         }
@@ -1327,7 +1054,8 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
             if dock.stateDidChange == nil {
                 dock.stateDidChange = { [weak self] in self?.scheduleTick() }
             }
-            dock.update(byScreen[id] ?? [], style: style, on: screen)
+            dock.update(byScreen[id] ?? [], style: style, on: screen,
+                        systemDockIsPresent: id == dockHost)
         }
     }
 }
@@ -1338,8 +1066,14 @@ extension NSScreen {
     }
 }
 
+let app = NSApplication.shared
+
 if CommandLine.arguments.contains("--selftest") {
-    let primaryTop = NSScreen.screens[0].frame.maxY
+    guard let mainScreen = primaryScreen() else {
+        print("selftest requires an active WindowServer session")
+        exit(2)
+    }
+    let primaryTop = mainScreen.frame.maxY
     for y in [0.0, 100.0, primaryTop] {  // CG<->Cocoa flip is its own inverse
         let p = CGPoint(x: 5, y: y)
         assert(cocoaPoint(cocoaPoint(p)) == p)
@@ -1440,7 +1174,6 @@ if CommandLine.arguments.contains("--selftest") {
     exit(0)
 }
 
-let app = NSApplication.shared
 let controller = Controller()
 app.delegate = controller
 app.setActivationPolicy(.accessory)

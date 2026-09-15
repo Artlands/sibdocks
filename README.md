@@ -1,17 +1,17 @@
 # SibDocks
 
-A dock for every extended display. Each external screen gets its own strip
-showing only the windows currently assigned to that screen; clicking an icon
-raises that window on the display whose strip was clicked.
+A dock for every display that is not currently hosting the system Dock. Each
+screen gets its own strip showing only the windows currently assigned to that
+screen; clicking an icon raises that window on the display whose strip was
+clicked.
 
 macOS gives you one Dock that follows the active display and lists *apps*.
-SibDocks gives you one strip per extended display that lists *windows*, and
-only the ones living on that display.
+SibDocks gives you one strip per other display that lists *windows*, and only
+the ones living on that display.
 
-The main display continues to use the system Dock. If the system Dock is
-temporarily visiting an external display, SibDocks leaves that display clear
-until the system Dock moves away, preventing two docks from being stacked on
-the same edge.
+The display currently hosting the system Dock continues to use it. If the
+system Dock visits another display, SibDocks takes over the display it left,
+preventing two docks from being stacked on the same edge.
 
 ## Requirements
 
@@ -23,12 +23,16 @@ the same edge.
 
 ```sh
 ./build.sh          # produces SibDocks.app
-open SibDocks.app   # prompts for Accessibility, then quits
-open SibDocks.app   # again, after granting
+open SibDocks.app   # appears in the menu bar and requests Accessibility
 ```
 
 The first launch asks for Accessibility in System Settings → Privacy &
-Security → Accessibility, then exits. Grant it and open the app again.
+Security → Accessibility. SibDocks remains available in the menu bar while it
+waits for approval and starts its display docks automatically after access is
+granted. The display strips may be empty until approval is granted, because
+macOS does not expose application windows to SibDocks without Accessibility.
+The menu-bar item also includes a shortcut to the Accessibility pane if the
+permission prompt was dismissed.
 
 **Every rebuild costs you that grant.** Ad-hoc signing ties the Accessibility
 permission to the binary's cdhash, so a rebuilt binary is a different binary as
@@ -37,11 +41,18 @@ far as TCC is concerned, and it gets denied with no prompt. `build.sh` runs
 next launch asks again rather than quitting silently. Sign with a stable
 self-signed certificate instead if the re-approval gets tiresome.
 It runs as an `LSUIElement` agent: no Dock icon, no app menu. Quitting is
-through the menu bar icon → **Quit SibDocks**, or from a terminal:
+through the menu bar icon → **Quit SibDocks**, and the same menu includes a
+checkable **Start SibDocks at Login** option. This uses macOS's native Login
+Items registration, so the setting can also be reviewed in System Settings →
+General → Login Items. From a terminal, it can also be stopped with:
 
 ```sh
 pkill -x SibDocks
 ```
+
+The login-item setting is independent of Accessibility permission. SibDocks
+still needs Accessibility enabled under System Settings → Privacy & Security
+→ Accessibility before it can enumerate and control application windows.
 
 SibDocks uses the native `dock.rectangle` symbol for its application and menu
 bar icon. The bundle icon is rendered directly from that same SF Symbol during
@@ -100,8 +111,8 @@ The background is `NSGlassEffectView`, the same Liquid Glass material the
 system Dock uses on macOS 26 and later, so light and dark mode come for free.
 
 Padding, gaps, and corner radius are ratios of `tilesize`, calibrated against
-the stock Dock: at `tilesize 42` the real Dock claims a 62pt screen inset, and
-so does SibDocks (8 pad + 42 tile + 8 pad + 4 margin). They are grouped in
+the stock Dock. At `tilesize 42`, SibDocks uses an 8pt pad, a 6pt indicator
+lane, a 64pt glass depth, and a 4pt edge margin. They are grouped in
 `DockStyle` if a future macOS restyles the Dock and they need re-tuning.
 
 ## How it works
@@ -113,20 +124,23 @@ so does SibDocks (8 pad + 42 tile + 8 pad + 4 margin). They are grouped in
 2. Each window's center is converted from CoreGraphics global coordinates
    (origin top-left of the primary display, y down) to Cocoa coordinates
    (origin bottom-left, y up) and matched against `NSScreen.frame`.
-3. The main display is skipped because it owns the system Dock. The display
-   hosting the real macOS Dock is also skipped while the Dock is visiting an
-   external display, so the two strips never overlap.
-4. One borderless non-activating `NSPanel` per remaining extended display renders that
+3. The display hosting the real macOS Dock is suppressed so the two strips
+   never overlap. Its SibDocks panel is retained and revealed as soon as the
+   system Dock moves away; this can include the primary display when the Dock
+   is visiting an external display.
+4. One borderless non-activating `NSPanel` per remaining display renders that
    screen's windows as app icons on a glass strip along the configured edge.
-   A panel with no windows hides itself.
-5. A global mouse monitor drives magnification and toggles
-   `ignoresMouseEvents`, so each panel swallows clicks on the strip and its
-   icons but stays click-through over the transparent headroom that magnified
-   icons need. Tracking areas would not work here, since a click-through panel
-   does not receive its own events.
+   An empty display keeps a minimum tile-sized glass strip visible so the
+   per-display dock does not disappear while waiting for a window.
+5. A global mouse monitor drives magnification. Each visible panel owns its
+   narrow dock footprint so primary and secondary clicks reliably reach the
+   icon controls; the panel is hidden entirely when auto-hide is active.
 6. AX observers wake the controller immediately for window creation, movement,
    title, minimize, and app-hidden changes; a one-second poll remains as a
    recovery path for applications that do not emit useful AX notifications.
+   System Dock ownership is checked separately at a shorter interval because
+   moving the Dock between displays does not reliably emit a screen-change
+   notification.
    Clicking an icon moves the window onto that strip's screen, unhides the app,
    clears `AXMinimized`, sets `AXMain`, performs `AXRaise`, and activates the
    app. It acts on the stored element directly, so there is no window-matching
@@ -201,16 +215,18 @@ that display arrangement. Run this before filing anything.
   cannot suppress the system Dock's copy without private, fragile APIs.
 - **One button per window, no grouping.** With enough windows open the strip
   runs off the edge of the screen. Group by app when that starts to bite.
-- **Raise only.** No minimize, close, or quit from the strip.
-- **Some Dock details remain private.** Size, magnification, position, and
-  auto-hide are tracked. Minimise effects, running-app indicators, and the
-  recents section are not exposed to third-party apps.
+- **Tile click versus context actions.** A normal tile click raises/restores a
+  window. The native context menu also provides Hide, Quit, and Show in Finder.
+- **Some Dock details remain private.** Size, magnification, position,
+  auto-hide, minimize effect, and the indicator preference are mirrored. The
+  recents section and the Dock's exact animation, spacing, and indicator
+  geometry are not exposed to third-party apps.
 - **Magnification is an approximation.** Each tile is scaled from its resting
   centre and the magnified widths are then laid out cumulatively. The real Dock
   solves position and width together. Close, not identical.
 - **Auto-hide detection.** When the system Dock is hidden, its on-screen window
-  is unavailable, so SibDocks relies on the primary-display rule and its own
-  auto-hide preference mirror until the Dock reappears.
+  is unavailable, so SibDocks retains the last known Dock host (or falls back
+  to the main display) until the Dock reappears.
 - **No fullscreen handling.** The panel is `fullScreenAuxiliary`, so it floats
   over fullscreen windows rather than hiding.
 - **Other Spaces are not filtered.** A window on another Space is neither
@@ -220,6 +236,8 @@ that display arrangement. Run this before filing anything.
 
 ```
 Package.swift            SwiftPM manifest
-Sources/SibDocks/main.swift   everything
-build.sh                 assembles and signs SibDocks.app
+Sources/SibDocks/main.swift      everything
+Assets/AppIcon.icns              native dock.rectangle bundle icon
+Scripts/render_menu_icon.swift   regenerates the icon during builds
+build.sh                         assembles and signs SibDocks.app
 ```
