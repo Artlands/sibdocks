@@ -1,0 +1,8 @@
+# Swift package build output
+.build/
+.swiftpm/
+
+# Built app bundle, produced by ./build.sh
+SibDocks.app/
+
+.DS_Store
