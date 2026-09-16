@@ -110,6 +110,13 @@ every tick, so a change shows up within a second:
 The background is `NSGlassEffectView`, the same Liquid Glass material the
 system Dock uses on macOS 26 and later, so light and dark mode come for free.
 
+When a fixed SibDocks strip is visible, its edge footprint is reserved from
+application windows. SibDocks uses the screen's `visibleFrame` as the base
+usable area and keeps visible windows inside the remaining area through its
+Accessibility connection, including resizing windows that are larger than
+the available space. Auto-hidden strips keep the system Dock's overlay
+behavior and do not reserve a permanent strip.
+
 Padding, gaps, and corner radius are ratios of `tilesize`, calibrated against
 the stock Dock. At `tilesize 42`, SibDocks uses an 8pt pad, a 6pt indicator
 lane, a 64pt glass depth, and a 4pt edge margin. They are grouped in
@@ -125,16 +132,17 @@ lane, a 64pt glass depth, and a 4pt edge margin. They are grouped in
    (origin top-left of the primary display, y down) to Cocoa coordinates
    (origin bottom-left, y up) and matched against `NSScreen.frame`.
 3. The display hosting the real macOS Dock is suppressed so the two strips
-   never overlap. Its SibDocks panel is retained and revealed as soon as the
-   system Dock moves away; this can include the primary display when the Dock
-   is visiting an external display.
+   never overlap. SibDocks recreates its panel when the system Dock moves
+   away; this can include the primary display when the Dock is visiting an
+   external display.
 4. One borderless non-activating `NSPanel` per remaining display renders that
    screen's windows as app icons on a glass strip along the configured edge.
-   An empty display keeps a minimum tile-sized glass strip visible so the
-   per-display dock does not disappear while waiting for a window.
-5. A global mouse monitor drives magnification. Each visible panel owns its
-   narrow dock footprint so primary and secondary clicks reliably reach the
-   icon controls; the panel is hidden entirely when auto-hide is active.
+   Displays with no windows keep no panel, so the strip appears when the first
+   window arrives.
+5. A global mouse monitor drives magnification. Fixed docks reserve their
+   resting edge footprint from application windows through Accessibility, and
+   each visible panel keeps its narrow clickable strip; auto-hidden panels
+   overlay content only while revealed.
 6. AX observers wake the controller immediately for window creation, movement,
    title, minimize, and app-hidden changes; a one-second poll remains as a
    recovery path for applications that do not emit useful AX notifications.
@@ -168,11 +176,13 @@ stays valid for the window's lifetime, clicks act on it directly.
 swift build && ./.build/debug/SibDocks --selftest
 ```
 
-Asserts that the coordinate flip is its own inverse and that live windows
-resolve to real screens, then prints the screen → window mapping:
+Asserts that the coordinate flip is its own inverse, the resting Dock
+footprint is reserved on every edge, and live windows resolve to real screens;
+it then prints the screen → window mapping:
 
 ```
 layout ok (bottom/left/right, magnified + resting)
+reservation geometry ok (bottom/left/right)
 accessibility trusted: true
 [DELL U2720Q] sibdocks
 [DELL P2725QE] NSF_Proposal_AI_Datasets_2026 - Overleaf - Google Chrome
@@ -214,7 +224,8 @@ that display arrangement. Run this before filing anything.
   SibDocks mirrors the state and provides correct per-display restoration; it
   cannot suppress the system Dock's copy without private, fragile APIs.
 - **One button per window, no grouping.** With enough windows open the strip
-  runs off the edge of the screen. Group by app when that starts to bite.
+  proportionally compresses its tiles to keep every window on the display.
+  Group by app would be needed for larger collections.
 - **Tile click versus context actions.** A normal tile click raises/restores a
   window. The native context menu also provides Hide, Quit, and Show in Finder.
 - **Some Dock details remain private.** Size, magnification, position,
@@ -227,8 +238,8 @@ that display arrangement. Run this before filing anything.
 - **Auto-hide detection.** When the system Dock is hidden, its on-screen window
   is unavailable, so SibDocks retains the last known Dock host (or falls back
   to the main display) until the Dock reappears.
-- **No fullscreen handling.** The panel is `fullScreenAuxiliary`, so it floats
-  over fullscreen windows rather than hiding.
+- **Fullscreen handling.** SibDocks does not join another app's true
+  full-screen Space, matching the system Dock's behavior.
 - **Other Spaces are not filtered.** A window on another Space is neither
   minimized nor hidden, so it appears on its screen's strip as a normal tile.
 

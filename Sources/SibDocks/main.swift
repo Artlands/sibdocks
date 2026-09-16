@@ -59,20 +59,28 @@ func axFrame(_ el: AXUIElement) -> CGRect? {
 
 // MARK: - Moving windows
 
-func setAXPosition(_ el: AXUIElement, _ p: CGPoint) {
+@discardableResult
+func setAXPosition(_ el: AXUIElement, _ p: CGPoint) -> Bool {
     var p = p
-    guard let v = AXValueCreate(.cgPoint, &p) else { return }
-    AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, v)
+    guard let v = AXValueCreate(.cgPoint, &p) else { return false }
+    return AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, v) == .success
 }
 
-/// NSScreen.frame in CoreGraphics coords, so it can be compared with window
-/// frames without flipping every value at the call site.
+@discardableResult
+func setAXSize(_ el: AXUIElement, _ size: CGSize) -> Bool {
+    var size = size
+    guard let v = AXValueCreate(.cgSize, &size) else { return false }
+    return AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, v) == .success
+}
+
 func primaryScreen() -> NSScreen? {
     let mainDisplay = CGMainDisplayID()
     return NSScreen.screens.first(where: { $0.displayID == mainDisplay })
         ?? NSScreen.screens.first
 }
 
+/// Convert an NSScreen frame from Cocoa coordinates to the Quartz coordinates
+/// used by Accessibility, so it can be compared with AX window frames.
 func cgFrame(of screen: NSScreen) -> CGRect {
     let primaryTop = primaryScreen()?.frame.maxY ?? 0
     let f = screen.frame
@@ -260,6 +268,14 @@ struct DockStyle: Equatable {
     var maxScale: CGFloat { magnify ? max(1, large / tile) : 1 }
     var isVertical: Bool { edge != .bottom }
 
+    /// The expanded panel depth, including room for magnified icons to spill
+    /// beyond the resting glass.
+    var expandedDepth: CGFloat {
+        let largestIcon = tile * maxScale
+        return max(thickness,
+                   pad + largestIcon + indicatorLane(for: largestIcon) + pad)
+    }
+
     static func current() -> DockStyle {
         let d = UserDefaults(suiteName: "com.apple.dock")
         func num(_ key: String, _ fallback: CGFloat) -> CGFloat {
@@ -441,6 +457,82 @@ final class DockContentView: NSView {
 
 }
 
+/// Convert between the Quartz coordinates used by Accessibility and the
+/// Cocoa coordinates used by NSScreen.visibleFrame.
+func cocoaRect(fromCG rect: CGRect) -> NSRect {
+    let top = primaryScreen()?.frame.maxY ?? 0
+    return NSRect(x: rect.minX, y: top - rect.maxY, width: rect.width, height: rect.height)
+}
+
+func cgRect(fromCocoa rect: NSRect) -> CGRect {
+    let top = primaryScreen()?.frame.maxY ?? 0
+    return CGRect(x: rect.minX, y: top - rect.maxY, width: rect.width, height: rect.height)
+}
+
+/// The portion of a display available to ordinary windows when SibDocks is
+/// acting as a fixed Dock. visibleFrame already excludes the menu bar and the
+/// real Dock; this adds SibDocks' own edge reservation on displays where it
+/// is present.
+func sibDocksUsableFrame(on screen: NSScreen, style: DockStyle) -> NSRect {
+    var usable = screen.visibleFrame
+    let screenFrame = screen.frame
+    // Magnified icons are an interactive spill area. The permanent
+    // reservation follows the dock's resting glass footprint; the expanded
+    // hover state may temporarily overlay that extra headroom just like the
+    // system Dock does.
+    let reserved = style.margin + style.thickness
+
+    switch style.edge {
+    case .bottom:
+        let minY = min(max(usable.minY, screenFrame.minY + reserved), usable.maxY)
+        usable = NSRect(x: usable.minX, y: minY, width: usable.width,
+                        height: max(0, usable.maxY - minY))
+    case .left:
+        let minX = min(max(usable.minX, screenFrame.minX + reserved), usable.maxX)
+        usable = NSRect(x: minX, y: usable.minY,
+                        width: max(0, usable.maxX - minX), height: usable.height)
+    case .right:
+        let maxX = min(max(usable.minX, screenFrame.maxX - reserved), usable.maxX)
+        usable = NSRect(x: usable.minX, y: usable.minY,
+                        width: max(0, maxX - usable.minX), height: usable.height)
+    }
+    return usable
+}
+
+/// Keeps a visible application window out of the SibDocks footprint. The
+/// window is moved when it fits and resized first when it is larger than the
+/// remaining usable area, matching the practical effect of a fixed system
+/// Dock on zoomed windows.
+@MainActor
+@discardableResult
+func keepWindowOutOfSibDocks(_ window: WinInfo, on screen: NSScreen,
+                             style: DockStyle) -> CGRect? {
+    guard !window.stowed else { return nil }
+    let usable = sibDocksUsableFrame(on: screen, style: style)
+    let current = cocoaRect(fromCG: window.frame)
+    guard !usable.contains(current) else { return nil }
+
+    let width = min(current.width, usable.width)
+    let height = min(current.height, usable.height)
+    let target = NSRect(
+        x: min(max(current.minX, usable.minX), max(usable.minX, usable.maxX - width)),
+        y: min(max(current.minY, usable.minY), max(usable.minY, usable.maxY - height)),
+        width: width,
+        height: height)
+    let targetCG = cgRect(fromCocoa: target)
+
+    let needsSizeChange = abs(target.width - current.width) > 0.5
+        || abs(target.height - current.height) > 0.5
+    let needsPositionChange = abs(target.minX - current.minX) > 0.5
+        || abs(target.minY - current.minY) > 0.5
+    let sizeChanged = !needsSizeChange || setAXSize(window.element, target.size)
+    let positionChanged = !needsPositionChange || setAXPosition(window.element, targetCG.origin)
+    // Do not replace the cached restore frame when the app rejects either AX
+    // write; the existing frame is safer than a target that was never applied.
+    guard sizeChanged && positionChanged else { return nil }
+    return targetCG
+}
+
 final class DockPanel: NSPanel {
     private var shown: [WinInfo] = []
     private var shownStyle: DockStyle?
@@ -457,12 +549,15 @@ final class DockPanel: NSPanel {
         super.init(contentRect: .zero,
                    styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
-        isFloatingPanel = true
-        level = .floating
+        // Match the system Dock's window-server level. The typed `.dock`
+        // constant is deprecated even though the underlying level remains
+        // the correct one, so use the current CoreGraphics value directly.
+        level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)))
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false  // the glass carries its own
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        // The system Dock does not cover another app's true full-screen Space.
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         hidesOnDeactivate = false
         contentView = DockContentView()
     }
@@ -481,6 +576,10 @@ final class DockPanel: NSPanel {
         homeScreen = screen
         body.style = style
         body.layoutAnimationDuration = style.animationDuration
+        // update() always lays out a fresh resting frame. A hover state from
+        // the previous frame would otherwise magnify into the compact bounds
+        // after a display reconfiguration or Dock handoff.
+        body.cursor = nil
 
         hideWorkItem?.cancel()
         // Nothing to point at: no tiles on this display, or the real Dock is here.
@@ -511,22 +610,12 @@ final class DockPanel: NSPanel {
             body.addSubview(b)
         }
 
-        // Room for the strip, plus headroom for magnified icons to spill out of it.
-        let largestIcon = style.tile * style.maxScale
-        let depth = max(style.thickness,
-                        style.pad + largestIcon + style.indicatorLane(for: largestIcon) + style.pad)
+        // At rest the panel is only as deep and long as the visible glass.
+        // Magnification expands it temporarily from hover().
+        let depth = style.thickness
         let n = CGFloat(wins.count)
-        let length = n * style.tile * style.maxScale + (n - 1) * style.gap + 2 * style.pad
-        let f = screen.frame
-
-        let frame: NSRect = switch style.edge {
-        case .bottom: NSRect(x: f.midX - length / 2, y: f.minY + style.margin,
-                             width: min(length, f.width), height: depth)
-        case .left:   NSRect(x: f.minX + style.margin, y: f.midY - length / 2,
-                             width: depth, height: min(length, f.height))
-        case .right:  NSRect(x: f.maxX - style.margin - depth, y: f.midY - length / 2,
-                             width: depth, height: min(length, f.height))
-        }
+        let length = n * style.tile + (n - 1) * style.gap + 2 * style.pad
+        let frame = frame(on: screen, style: style, length: length, depth: depth)
         setFrame(frame, display: true)
         body.needsLayout = true
         if style.autoHide && !nearEdge(NSEvent.mouseLocation) {
@@ -554,6 +643,7 @@ final class DockPanel: NSPanel {
         let p = body.convert(convertPoint(fromScreen: screenPoint), from: nil)
         let inside = NSPointInRect(p, body.bounds)
         let cursor: CGFloat? = inside ? (body.style.isVertical ? p.y : p.x) : nil
+        let wasExpanded = body.cursor != nil && body.style.magnify
         let changed: Bool
         if let old = body.cursor, let cursor {
             changed = abs(old - cursor) > 0.5
@@ -561,6 +651,10 @@ final class DockPanel: NSPanel {
             changed = body.cursor != cursor
         }
         body.cursor = cursor
+        let isExpanded = cursor != nil && body.style.magnify
+        if isExpanded != wasExpanded {
+            resizeForHover(expanded: isExpanded)
+        }
         if changed {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = body.style.animationDuration
@@ -580,6 +674,34 @@ final class DockPanel: NSPanel {
         case .left: return point.x <= f.minX + slop
         case .right: return point.x >= f.maxX - slop
         }
+    }
+
+    private func frame(on screen: NSScreen, style: DockStyle,
+                       length: CGFloat, depth: CGFloat) -> NSRect {
+        let f = screen.frame
+        switch style.edge {
+        case .bottom:
+            return NSRect(x: f.midX - length / 2, y: f.minY + style.margin,
+                          width: min(length, f.width), height: depth)
+        case .left:
+            return NSRect(x: f.minX + style.margin, y: f.midY - length / 2,
+                          width: depth, height: min(length, f.height))
+        case .right:
+            return NSRect(x: f.maxX - style.margin - depth, y: f.midY - length / 2,
+                          width: depth, height: min(length, f.height))
+        }
+    }
+
+    private func resizeForHover(expanded: Bool) {
+        guard let screen = homeScreen, !shown.isEmpty else { return }
+        let scale = expanded ? body.style.maxScale : 1
+        let count = CGFloat(shown.count)
+        let length = count * body.style.tile * scale
+            + (count - 1) * body.style.gap + 2 * body.style.pad
+        let depth = expanded ? body.style.expandedDepth : body.style.thickness
+        let target = frame(on: screen, style: body.style, length: length, depth: depth)
+        setFrame(target, display: true, animate: true)
+        body.needsLayout = true
     }
 
     private func reveal(animated: Bool) {
@@ -1041,6 +1163,26 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
         for (id, dock) in Array(docks) where !live.contains(id) {
             dock.orderOut(nil); docks[id] = nil
         }
+
+        // A third-party window cannot change NSScreen.visibleFrame the way
+        // the private system Dock does. Enforce the same usable-area rule for
+        // visible windows through the Accessibility permission SibDocks
+        // already requires. Auto-hidden docks intentionally overlay content
+        // only while revealed, like the system Dock, so they do not reserve a
+        // permanent strip.
+        if !style.autoHide {
+            for screen in NSScreen.screens {
+                guard let id = screen.displayID, live.contains(id),
+                      let screenWindows = byScreen[id], !screenWindows.isEmpty
+                else { continue }
+                for window in screenWindows {
+                    if let adjusted = keepWindowOutOfSibDocks(window, on: screen, style: style) {
+                        locations[window.id]?.frame = adjusted
+                    }
+                }
+            }
+        }
+
         for screen in NSScreen.screens {
             guard let id = screen.displayID, live.contains(id) else { continue }
             let dock = docks[id] ?? {
@@ -1104,6 +1246,27 @@ if CommandLine.arguments.contains("--selftest") {
                "tiles magnified with no cursor on \(edge)")
     }
     print("layout ok (bottom/left/right, magnified + resting)")
+
+    // Reservation geometry: every fixed edge must leave the resting panel
+    // footprint outside the area available to application windows.
+    for edge in [DockEdge.bottom, .left, .right] {
+        let style = DockStyle(tile: 42, large: 72, magnify: true, edge: edge)
+        let usable = sibDocksUsableFrame(on: mainScreen, style: style)
+        let f = mainScreen.frame
+        let reserved = style.margin + style.thickness
+        switch edge {
+        case .bottom:
+            assert(usable.minY >= f.minY + reserved - 0.01,
+                   "bottom Dock footprint is not reserved")
+        case .left:
+            assert(usable.minX >= f.minX + reserved - 0.01,
+                   "left Dock footprint is not reserved")
+        case .right:
+            assert(usable.maxX <= f.maxX - reserved + 0.01,
+                   "right Dock footprint is not reserved")
+        }
+    }
+    print("reservation geometry ok (bottom/left/right)")
 
     if CommandLine.arguments.contains("--dump") {
         for app in NSWorkspace.shared.runningApplications
