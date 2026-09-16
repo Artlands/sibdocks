@@ -510,6 +510,13 @@ func keepWindowOutOfSibDocks(_ window: WinInfo, on screen: NSScreen,
     guard !window.stowed else { return nil }
     let usable = sibDocksUsableFrame(on: screen, style: style)
     let current = cocoaRect(fromCG: window.frame)
+    // A window has to cross the display boundary before its centre is
+    // reported on the destination display. During that transition its frame
+    // is outside the source display (and may be in the gap between displays).
+    // Do not clamp or resize it back to the source display, or dragging
+    // between displays becomes impossible. This also leaves intentionally
+    // spanning windows alone.
+    guard screen.frame.contains(current) else { return nil }
     guard !usable.contains(current) else { return nil }
 
     let width = min(current.width, usable.width)
@@ -1170,7 +1177,10 @@ private func accessibilityCallback(observer: AXObserver, element: AXUIElement,
         // already requires. Auto-hidden docks intentionally overlay content
         // only while revealed, like the system Dock, so they do not reserve a
         // permanent strip.
-        if !style.autoHide {
+        // AX moved notifications arrive while the user is dragging a window.
+        // Defer reservation writes until the drag ends; otherwise a transient
+        // position at the edge can fight the user's drag gesture.
+        if !style.autoHide && NSEvent.pressedMouseButtons == 0 {
             for screen in NSScreen.screens {
                 guard let id = screen.displayID, live.contains(id),
                       let screenWindows = byScreen[id], !screenWindows.isEmpty

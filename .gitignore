@@ -5,4 +5,7 @@
 # Built app bundle, produced by ./build.sh
 SibDocks.app/
 
+# Release archives and staging directories
+dist/
+
 .DS_Store

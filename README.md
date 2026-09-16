@@ -19,12 +19,43 @@ preventing two docks from being stacked on the same edge.
 - Swift 6 toolchain (Xcode Command Line Tools is enough)
 - Accessibility permission
 
+The published app uses bundle identifier `com.artlands.sibdocks`.
+
 ## Build and run
 
 ```sh
 ./build.sh          # produces SibDocks.app
 open SibDocks.app   # appears in the menu bar and requests Accessibility
 ```
+
+For a local Homebrew-compatible archive:
+
+```sh
+./Scripts/package-release.sh 0.1.0
+./Scripts/update-cask.sh 0.1.0
+```
+
+This produces `dist/SibDocks-0.1.0.zip`, its SHA-256 sidecar, and the cask in
+`Casks/sibdocks.rb`. The archive is ad-hoc signed by default for development;
+that is not sufficient for a public Homebrew release because Gatekeeper will
+reject it. Set `SIGNING_IDENTITY` to a Developer ID Application identity and
+`NOTARY_PROFILE` to an `xcrun notarytool` profile when producing the release
+archive. The release workflow enforces both.
+
+The cask is ready to submit to `homebrew/cask` after the matching GitHub
+release exists. For a personal tap, copy `Casks/sibdocks.rb` into an
+`Artlands/homebrew-sibdocks` repository and install with:
+
+```sh
+brew tap Artlands/sibdocks
+brew install --cask sibdocks
+```
+
+GitHub tag pushes matching `vMAJOR.MINOR.PATCH` run the signed/notarized
+release workflow. Configure these repository secrets first:
+`DEVELOPER_ID_CERTIFICATE_P12_BASE64`, `DEVELOPER_ID_CERTIFICATE_PASSWORD`,
+`BUILD_KEYCHAIN_PASSWORD`, `APPLE_NOTARY_KEY_BASE64`, `APPLE_NOTARY_KEY_ID`,
+and `APPLE_NOTARY_ISSUER`.
 
 The first launch asks for Accessibility in System Settings → Privacy &
 Security → Accessibility. SibDocks remains available in the menu bar while it
@@ -37,7 +68,7 @@ permission prompt was dismissed.
 **Every rebuild costs you that grant.** Ad-hoc signing ties the Accessibility
 permission to the binary's cdhash, so a rebuilt binary is a different binary as
 far as TCC is concerned, and it gets denied with no prompt. `build.sh` runs
-`tccutil reset Accessibility local.sibdocks` to clear the stale entry, so the
+`tccutil reset Accessibility com.artlands.sibdocks` to clear the stale entry, so the
 next launch asks again rather than quitting silently. Sign with a stable
 self-signed certificate instead if the re-approval gets tiresome.
 It runs as an `LSUIElement` agent: no Dock icon, no app menu. Quitting is
